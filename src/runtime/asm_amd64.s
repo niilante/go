@@ -7,6 +7,83 @@
 #include "funcdata.h"
 #include "textflag.h"
 
+// _rt0_amd64 is common startup code for most amd64 systems when using
+// internal linking. This is the entry point for the program from the
+// kernel for an ordinary -buildmode=exe program. The stack holds the
+// number of arguments and the C-style argv.
+TEXT _rt0_amd64(SB),NOSPLIT,$-8
+	MOVQ	0(SP), DI	// argc
+	LEAQ	8(SP), SI	// argv
+	JMP	runtime·rt0_go(SB)
+
+// main is common startup code for most amd64 systems when using
+// external linking. The C startup code will call the symbol "main"
+// passing argc and argv in the usual C ABI registers DI and SI.
+TEXT main(SB),NOSPLIT,$-8
+	JMP	runtime·rt0_go(SB)
+
+// _rt0_amd64_lib is common startup code for most amd64 systems when
+// using -buildmode=c-archive or -buildmode=c-shared. The linker will
+// arrange to invoke this function as a global constructor (for
+// c-archive) or when the shared library is loaded (for c-shared).
+// We expect argc and argv to be passed in the usual C ABI registers
+// DI and SI.
+TEXT _rt0_amd64_lib(SB),NOSPLIT,$0x50
+	// Align stack per ELF ABI requirements.
+	MOVQ	SP, AX
+	ANDQ	$~15, SP
+	// Save C ABI callee-saved registers, as caller may need them.
+	MOVQ	BX, 0x10(SP)
+	MOVQ	BP, 0x18(SP)
+	MOVQ	R12, 0x20(SP)
+	MOVQ	R13, 0x28(SP)
+	MOVQ	R14, 0x30(SP)
+	MOVQ	R15, 0x38(SP)
+	MOVQ	AX, 0x40(SP)
+
+	MOVQ	DI, _rt0_amd64_lib_argc<>(SB)
+	MOVQ	SI, _rt0_amd64_lib_argv<>(SB)
+
+	// Synchronous initialization.
+	CALL	runtime·libpreinit(SB)
+
+	// Create a new thread to finish Go runtime initialization.
+	MOVQ	_cgo_sys_thread_create(SB), AX
+	TESTQ	AX, AX
+	JZ	nocgo
+	MOVQ	$_rt0_amd64_lib_go(SB), DI
+	MOVQ	$0, SI
+	CALL	AX
+	JMP	restore
+
+nocgo:
+	MOVQ	$0x800000, 0(SP)		// stacksize
+	MOVQ	$_rt0_amd64_lib_go(SB), AX
+	MOVQ	AX, 8(SP)			// fn
+	CALL	runtime·newosproc0(SB)
+
+restore:
+	MOVQ	0x10(SP), BX
+	MOVQ	0x18(SP), BP
+	MOVQ	0x20(SP), R12
+	MOVQ	0x28(SP), R13
+	MOVQ	0x30(SP), R14
+	MOVQ	0x38(SP), R15
+	MOVQ	0x40(SP), SP
+	RET
+
+// _rt0_amd64_lib_go initializes the Go runtime.
+// This is started in a separate thread by _rt0_amd64_lib.
+TEXT _rt0_amd64_lib_go(SB),NOSPLIT,$0
+	MOVQ	_rt0_amd64_lib_argc<>(SB), DI
+	MOVQ	_rt0_amd64_lib_argv<>(SB), SI
+	JMP	runtime·rt0_go(SB)
+
+DATA _rt0_amd64_lib_argc<>(SB)/8, $0
+GLOBL _rt0_amd64_lib_argc<>(SB),NOPTR, $8
+DATA _rt0_amd64_lib_argv<>(SB)/8, $0
+GLOBL _rt0_amd64_lib_argv<>(SB),NOPTR, $8
+
 TEXT runtime·rt0_go(SB),NOSPLIT,$0
 	// copy arguments forward on an even stack
 	MOVQ	DI, AX		// argc
@@ -26,10 +103,10 @@ TEXT runtime·rt0_go(SB),NOSPLIT,$0
 	MOVQ	SP, (g_stack+stack_hi)(DI)
 
 	// find out information about the processor we're on
-	MOVQ	$0, AX
+	MOVL	$0, AX
 	CPUID
-	MOVQ	AX, SI
-	CMPQ	AX, $0
+	MOVL	AX, SI
+	CMPL	AX, $0
 	JE	nocpuinfo
 
 	// Figure out how to serialize RDTSC.
@@ -41,47 +118,77 @@ TEXT runtime·rt0_go(SB),NOSPLIT,$0
 	JNE	notintel
 	CMPL	CX, $0x6C65746E  // "ntel"
 	JNE	notintel
+	MOVB	$1, runtime·isIntel(SB)
 	MOVB	$1, runtime·lfenceBeforeRdtsc(SB)
 notintel:
 
 	// Load EAX=1 cpuid flags
-	MOVQ	$1, AX
+	MOVL	$1, AX
 	CPUID
-	MOVL	CX, runtime·cpuid_ecx(SB)
-	MOVL	DX, runtime·cpuid_edx(SB)
+	MOVL	AX, runtime·processorVersionInfo(SB)
 
+	TESTL	$(1<<26), DX // SSE2
+	SETNE	runtime·support_sse2(SB)
+
+	TESTL	$(1<<9), CX // SSSE3
+	SETNE	runtime·support_ssse3(SB)
+
+	TESTL	$(1<<19), CX // SSE4.1
+	SETNE	runtime·support_sse41(SB)
+
+	TESTL	$(1<<20), CX // SSE4.2
+	SETNE	runtime·support_sse42(SB)
+
+	TESTL	$(1<<23), CX // POPCNT
+	SETNE	runtime·support_popcnt(SB)
+
+	TESTL	$(1<<25), CX // AES
+	SETNE	runtime·support_aes(SB)
+
+	TESTL	$(1<<27), CX // OSXSAVE
+	SETNE	runtime·support_osxsave(SB)
+
+	// If OS support for XMM and YMM is not present
+	// support_avx will be set back to false later.
+	TESTL	$(1<<28), CX // AVX
+	SETNE	runtime·support_avx(SB)
+
+eax7:
 	// Load EAX=7/ECX=0 cpuid flags
-	CMPQ	SI, $7
-	JLT	no7
+	CMPL	SI, $7
+	JLT	osavx
 	MOVL	$7, AX
 	MOVL	$0, CX
 	CPUID
-	MOVL	BX, runtime·cpuid_ebx7(SB)
-no7:
-	// Detect AVX and AVX2 as per 14.7.1  Detection of AVX2 chapter of [1]
-	// [1] 64-ia-32-architectures-software-developer-manual-325462.pdf
-	// http://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-manual-325462.pdf
-	MOVL	runtime·cpuid_ecx(SB), CX
-	ANDL    $0x18000000, CX // check for OSXSAVE and AVX bits
-	CMPL    CX, $0x18000000
-	JNE     noavx
-	MOVL    $0, CX
+
+	TESTL	$(1<<3), BX // BMI1
+	SETNE	runtime·support_bmi1(SB)
+
+	// If OS support for XMM and YMM is not present
+	// support_avx2 will be set back to false later.
+	TESTL	$(1<<5), BX
+	SETNE	runtime·support_avx2(SB)
+
+	TESTL	$(1<<8), BX // BMI2
+	SETNE	runtime·support_bmi2(SB)
+
+	TESTL	$(1<<9), BX // ERMS
+	SETNE	runtime·support_erms(SB)
+
+osavx:
+	CMPB	runtime·support_osxsave(SB), $1
+	JNE	noavx
+	MOVL	$0, CX
 	// For XGETBV, OSXSAVE bit is required and sufficient
 	XGETBV
-	ANDL    $6, AX
-	CMPL    AX, $6 // Check for OS support of YMM registers
-	JNE     noavx
-	MOVB    $1, runtime·support_avx(SB)
-	TESTL   $(1<<5), runtime·cpuid_ebx7(SB) // check for AVX2 bit
-	JEQ     noavx2
-	MOVB    $1, runtime·support_avx2(SB)
-	JMP     nocpuinfo
+	ANDL	$6, AX
+	CMPL	AX, $6 // Check for OS support of XMM and YMM registers.
+	JE nocpuinfo
 noavx:
-	MOVB    $0, runtime·support_avx(SB)
-noavx2:
-	MOVB    $0, runtime·support_avx2(SB)
-nocpuinfo:	
-	
+	MOVB $0, runtime·support_avx(SB)
+	MOVB $0, runtime·support_avx2(SB)
+
+nocpuinfo:
 	// if there is an _cgo_init, call it.
 	MOVQ	_cgo_init(SB), AX
 	TESTQ	AX, AX
@@ -182,8 +289,12 @@ TEXT runtime·gosave(SB), NOSPLIT, $0-8
 	MOVQ	0(SP), BX		// caller's PC
 	MOVQ	BX, gobuf_pc(AX)
 	MOVQ	$0, gobuf_ret(AX)
-	MOVQ	$0, gobuf_ctxt(AX)
 	MOVQ	BP, gobuf_bp(AX)
+	// Assert ctxt is zero. See func save.
+	MOVQ	gobuf_ctxt(AX), BX
+	TESTQ	BX, BX
+	JZ	2(PC)
+	CALL	runtime·badctxt(SB)
 	get_tls(CX)
 	MOVQ	g(CX), BX
 	MOVQ	BX, gobuf_g(AX)
@@ -191,7 +302,7 @@ TEXT runtime·gosave(SB), NOSPLIT, $0-8
 
 // void gogo(Gobuf*)
 // restore state from Gobuf; longjmp
-TEXT runtime·gogo(SB), NOSPLIT, $0-8
+TEXT runtime·gogo(SB), NOSPLIT, $16-8
 	MOVQ	buf+0(FP), BX		// gobuf
 	MOVQ	gobuf_g(BX), DX
 	MOVQ	0(DX), CX		// make sure g != nil
@@ -308,11 +419,12 @@ switch:
 	RET
 
 noswitch:
-	// already on m stack, just call directly
+	// already on m stack; tail call the function
+	// Using a tail call here cleans up tracebacks since we won't stop
+	// at an intermediate systemstack.
 	MOVQ	DI, DX
 	MOVQ	0(DI), DI
-	CALL	DI
-	RET
+	JMP	DI
 
 /*
  * support for morestack
@@ -331,13 +443,15 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVQ	g_m(BX), BX
 	MOVQ	m_g0(BX), SI
 	CMPQ	g(CX), SI
-	JNE	2(PC)
+	JNE	3(PC)
+	CALL	runtime·badmorestackg0(SB)
 	INT	$3
 
 	// Cannot grow signal stack (m->gsignal).
 	MOVQ	m_gsignal(BX), SI
 	CMPQ	g(CX), SI
-	JNE	2(PC)
+	JNE	3(PC)
+	CALL	runtime·badmorestackgsignal(SB)
 	INT	$3
 
 	// Called from f.
@@ -356,8 +470,8 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVQ	SI, (g_sched+gobuf_g)(SI)
 	LEAQ	8(SP), AX // f's SP
 	MOVQ	AX, (g_sched+gobuf_sp)(SI)
-	MOVQ	DX, (g_sched+gobuf_ctxt)(SI)
 	MOVQ	BP, (g_sched+gobuf_bp)(SI)
+	MOVQ	DX, (g_sched+gobuf_ctxt)(SI)
 
 	// Call newstack on m->g0's stack.
 	MOVQ	m_g0(BX), BX
@@ -371,28 +485,6 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 TEXT runtime·morestack_noctxt(SB),NOSPLIT,$0
 	MOVL	$0, DX
 	JMP	runtime·morestack(SB)
-
-TEXT runtime·stackBarrier(SB),NOSPLIT,$0
-	// We came here via a RET to an overwritten return PC.
-	// AX may be live. Other registers are available.
-
-	// Get the original return PC, g.stkbar[g.stkbarPos].savedLRVal.
-	get_tls(CX)
-	MOVQ	g(CX), CX
-	MOVQ	(g_stkbar+slice_array)(CX), DX
-	MOVQ	g_stkbarPos(CX), BX
-	IMULQ	$stkbar__size, BX	// Too big for SIB.
-	MOVQ	stkbar_savedLRPtr(DX)(BX*1), R8
-	MOVQ	stkbar_savedLRVal(DX)(BX*1), BX
-	// Assert that we're popping the right saved LR.
-	ADDQ	$8, R8
-	CMPQ	R8, SP
-	JEQ	2(PC)
-	MOVL	$0, 0
-	// Record that this stack barrier was hit.
-	ADDQ	$1, g_stkbarPos(CX)
-	// Jump to the original return PC.
-	JMP	BX
 
 // reflectcall: call a function with the given argument list
 // func call(argtype *_type, f *FuncVal, arg *byte, argsize, retoffset uint32).
@@ -412,8 +504,6 @@ TEXT reflect·call(SB), NOSPLIT, $0-0
 
 TEXT ·reflectcall(SB), NOSPLIT, $0-32
 	MOVLQZX argsize+24(FP), CX
-	// NOTE(rsc): No call16, because CALLFN needs four words
-	// of argument space to invoke callwritebarrier.
 	DISPATCH(runtime·call32, 32)
 	DISPATCH(runtime·call64, 64)
 	DISPATCH(runtime·call128, 128)
@@ -456,24 +546,28 @@ TEXT NAME(SB), WRAPPER, $MAXSIZE-32;		\
 	PCDATA  $PCDATA_StackMapIndex, $0;	\
 	CALL	(DX);				\
 	/* copy return values back */		\
+	MOVQ	argtype+0(FP), DX;		\
 	MOVQ	argptr+16(FP), DI;		\
 	MOVLQZX	argsize+24(FP), CX;		\
-	MOVLQZX retoffset+28(FP), BX;		\
+	MOVLQZX	retoffset+28(FP), BX;		\
 	MOVQ	SP, SI;				\
 	ADDQ	BX, DI;				\
 	ADDQ	BX, SI;				\
 	SUBQ	BX, CX;				\
-	REP;MOVSB;				\
-	/* execute write barrier updates */	\
-	MOVQ	argtype+0(FP), DX;		\
-	MOVQ	argptr+16(FP), DI;		\
-	MOVLQZX	argsize+24(FP), CX;		\
-	MOVLQZX retoffset+28(FP), BX;		\
-	MOVQ	DX, 0(SP);			\
-	MOVQ	DI, 8(SP);			\
-	MOVQ	CX, 16(SP);			\
-	MOVQ	BX, 24(SP);			\
-	CALL	runtime·callwritebarrier(SB);	\
+	CALL	callRet<>(SB);			\
+	RET
+
+// callRet copies return values back at the end of call*. This is a
+// separate function so it can allocate stack space for the arguments
+// to reflectcallmove. It does not follow the Go ABI; it expects its
+// arguments in registers.
+TEXT callRet<>(SB), NOSPLIT, $32-0
+	NO_LOCAL_POINTERS
+	MOVQ	DX, 0(SP)
+	MOVQ	DI, 8(SP)
+	MOVQ	SI, 16(SP)
+	MOVQ	CX, 24(SP)
+	CALL	runtime·reflectcallmove(SB)
 	RET
 
 CALLFN(·call32, 32)
@@ -540,8 +634,12 @@ TEXT gosave<>(SB),NOSPLIT,$0
 	LEAQ	8(SP), R9
 	MOVQ	R9, (g_sched+gobuf_sp)(R8)
 	MOVQ	$0, (g_sched+gobuf_ret)(R8)
-	MOVQ	$0, (g_sched+gobuf_ctxt)(R8)
 	MOVQ	BP, (g_sched+gobuf_bp)(R8)
+	// Assert ctxt is zero. See func save.
+	MOVQ	(g_sched+gobuf_ctxt)(R8), R9
+	TESTQ	R9, R9
+	JZ	2(PC)
+	CALL	runtime·badctxt(SB)
 	RET
 
 // func asmcgocall(fn, arg unsafe.Pointer) int32
@@ -716,7 +814,7 @@ havem:
 	MOVQ	(g_sched+gobuf_pc)(SI), BX
 	MOVQ	BX, -8(DI)
 	// Compute the size of the frame, including return PC and, if
-	// GOEXPERIMENT=framepointer, the saved based pointer
+	// GOEXPERIMENT=framepointer, the saved base pointer
 	MOVQ	ctxt+24(FP), BX
 	LEAQ	fv+0(FP), AX
 	SUBQ	SP, AX
@@ -799,32 +897,6 @@ TEXT runtime·stackcheck(SB), NOSPLIT, $0-0
 	INT	$3
 	RET
 
-TEXT runtime·getcallerpc(SB),NOSPLIT,$8-16
-	MOVQ	argp+0(FP),AX		// addr of first arg
-	MOVQ	-8(AX),AX		// get calling pc
-	CMPQ	AX, runtime·stackBarrierPC(SB)
-	JNE	nobar
-	// Get original return PC.
-	CALL	runtime·nextBarrierPC(SB)
-	MOVQ	0(SP), AX
-nobar:
-	MOVQ	AX, ret+8(FP)
-	RET
-
-TEXT runtime·setcallerpc(SB),NOSPLIT,$8-16
-	MOVQ	argp+0(FP),AX		// addr of first arg
-	MOVQ	pc+8(FP), BX
-	MOVQ	-8(AX), CX
-	CMPQ	CX, runtime·stackBarrierPC(SB)
-	JEQ	setbar
-	MOVQ	BX, -8(AX)		// set calling pc
-	RET
-setbar:
-	// Set the stack barrier return PC.
-	MOVQ	BX, 0(SP)
-	CALL	runtime·setNextBarrierPC(SB)
-	RET
-
 // func cputicks() int64
 TEXT runtime·cputicks(SB),NOSPLIT,$0-0
 	CMPB	runtime·lfenceBeforeRdtsc(SB), $1
@@ -838,23 +910,6 @@ done:
 	SHLQ	$32, DX
 	ADDQ	DX, AX
 	MOVQ	AX, ret+0(FP)
-	RET
-
-// memhash_varlen(p unsafe.Pointer, h seed) uintptr
-// redirects to memhash(p, h, size) using the size
-// stored in the closure.
-TEXT runtime·memhash_varlen(SB),NOSPLIT,$32-24
-	GO_ARGS
-	NO_LOCAL_POINTERS
-	MOVQ	p+0(FP), AX
-	MOVQ	h+8(FP), BX
-	MOVQ	8(DX), CX
-	MOVQ	AX, 0(SP)
-	MOVQ	BX, 8(SP)
-	MOVQ	CX, 16(SP)
-	CALL	runtime·memhash(SB)
-	MOVQ	24(SP), AX
-	MOVQ	AX, ret+16(FP)
 	RET
 
 // hash function using AES hardware instructions
@@ -1329,23 +1384,6 @@ eq:
 	MOVB	$1, ret+16(FP)
 	RET
 
-// eqstring tests whether two strings are equal.
-// The compiler guarantees that strings passed
-// to eqstring have equal length.
-// See runtime_test.go:eqstring_generic for
-// equivalent Go code.
-TEXT runtime·eqstring(SB),NOSPLIT,$0-33
-	MOVQ	s1_base+0(FP), SI
-	MOVQ	s2_base+16(FP), DI
-	CMPQ	SI, DI
-	JEQ	eq
-	MOVQ	s1_len+8(FP), BX
-	LEAQ	ret+32(FP), AX
-	JMP	runtime·memeqbody(SB)
-eq:
-	MOVB	$1, ret+32(FP)
-	RET
-
 // a in SI
 // b in DI
 // count in BX
@@ -1689,17 +1727,6 @@ big_loop_avx2_exit:
 	VZEROUPPER
 	JMP loop
 
-
-TEXT strings·supportAVX2(SB),NOSPLIT,$0-1
-	MOVBLZX runtime·support_avx2(SB), AX
-	MOVB AX, ret+0(FP)
-	RET
-
-TEXT bytes·supportAVX2(SB),NOSPLIT,$0-1
-	MOVBLZX runtime·support_avx2(SB), AX
-	MOVB AX, ret+0(FP)
-	RET
-
 TEXT strings·indexShortStr(SB),NOSPLIT,$0-40
 	MOVQ s+0(FP), DI
 	// We want len in DX and AX, because PCMPESTRI implicitly consumes them
@@ -1928,9 +1955,8 @@ success_avx2:
 	VZEROUPPER
 	JMP success
 sse42:
-	MOVL runtime·cpuid_ecx(SB), CX
-	ANDL $0x100000, CX
-	JZ no_sse42
+	CMPB runtime·support_sse42(SB), $1
+	JNE no_sse42
 	CMPQ AX, $12
 	// PCMPESTRI is slower than normal compare,
 	// so using it makes sense only if we advance 4+ bytes per compare
@@ -2124,17 +2150,194 @@ eqret:
 	MOVB	$0, ret+48(FP)
 	RET
 
-TEXT runtime·fastrand(SB), NOSPLIT, $0-4
-	get_tls(CX)
-	MOVQ	g(CX), AX
-	MOVQ	g_m(AX), AX
-	MOVL	m_fastrand(AX), DX
-	ADDL	DX, DX
-	MOVL	DX, BX
-	XORL	$0x88888eef, DX
-	CMOVLMI	BX, DX
-	MOVL	DX, m_fastrand(AX)
-	MOVL	DX, ret+0(FP)
+
+TEXT bytes·countByte(SB),NOSPLIT,$0-40
+	MOVQ s+0(FP), SI
+	MOVQ s_len+8(FP), BX
+	MOVB c+24(FP), AL
+	LEAQ ret+32(FP), R8
+	JMP  runtime·countByte(SB)
+
+TEXT strings·countByte(SB),NOSPLIT,$0-32
+	MOVQ s+0(FP), SI
+	MOVQ s_len+8(FP), BX
+	MOVB c+16(FP), AL
+	LEAQ ret+24(FP), R8
+	JMP  runtime·countByte(SB)
+
+// input:
+//   SI: data
+//   BX: data len
+//   AL: byte sought
+//   R8: address to put result
+// This requires the POPCNT instruction
+TEXT runtime·countByte(SB),NOSPLIT,$0
+	// Shuffle X0 around so that each byte contains
+	// the character we're looking for.
+	MOVD AX, X0
+	PUNPCKLBW X0, X0
+	PUNPCKLBW X0, X0
+	PSHUFL $0, X0, X0
+
+	CMPQ BX, $16
+	JLT small
+
+	MOVQ $0, R12 // Accumulator
+
+	MOVQ SI, DI
+
+	CMPQ BX, $32
+	JA avx2
+sse:
+	LEAQ	-16(SI)(BX*1), AX	// AX = address of last 16 bytes
+	JMP	sseloopentry
+
+sseloop:
+	// Move the next 16-byte chunk of the data into X1.
+	MOVOU	(DI), X1
+	// Compare bytes in X0 to X1.
+	PCMPEQB	X0, X1
+	// Take the top bit of each byte in X1 and put the result in DX.
+	PMOVMSKB X1, DX
+	// Count number of matching bytes
+	POPCNTL DX, DX
+	// Accumulate into R12
+	ADDQ DX, R12
+	// Advance to next block.
+	ADDQ	$16, DI
+sseloopentry:
+	CMPQ	DI, AX
+	JBE	sseloop
+
+	// Get the number of bytes to consider in the last 16 bytes
+	ANDQ $15, BX
+	JZ end
+
+	// Create mask to ignore overlap between previous 16 byte block
+	// and the next.
+	MOVQ $16,CX
+	SUBQ BX, CX
+	MOVQ $0xFFFF, R10
+	SARQ CL, R10
+	SALQ CL, R10
+
+	// Process the last 16-byte chunk. This chunk may overlap with the
+	// chunks we've already searched so we need to mask part of it.
+	MOVOU	(AX), X1
+	PCMPEQB	X0, X1
+	PMOVMSKB X1, DX
+	// Apply mask
+	ANDQ R10, DX
+	POPCNTL DX, DX
+	ADDQ DX, R12
+end:
+	MOVQ R12, (R8)
+	RET
+
+// handle for lengths < 16
+small:
+	TESTQ	BX, BX
+	JEQ	endzero
+
+	// Check if we'll load across a page boundary.
+	LEAQ	16(SI), AX
+	TESTW	$0xff0, AX
+	JEQ	endofpage
+
+	// We must ignore high bytes as they aren't part of our slice.
+	// Create mask.
+	MOVB BX, CX
+	MOVQ $1, R10
+	SALQ CL, R10
+	SUBQ $1, R10
+
+	// Load data
+	MOVOU	(SI), X1
+	// Compare target byte with each byte in data.
+	PCMPEQB	X0, X1
+	// Move result bits to integer register.
+	PMOVMSKB X1, DX
+	// Apply mask
+	ANDQ R10, DX
+	POPCNTL DX, DX
+	// Directly return DX, we don't need to accumulate
+	// since we have <16 bytes.
+	MOVQ	DX, (R8)
+	RET
+endzero:
+	MOVQ $0, (R8)
+	RET
+
+endofpage:
+	// We must ignore low bytes as they aren't part of our slice.
+	MOVQ $16,CX
+	SUBQ BX, CX
+	MOVQ $0xFFFF, R10
+	SARQ CL, R10
+	SALQ CL, R10
+
+	// Load data into the high end of X1.
+	MOVOU	-16(SI)(BX*1), X1
+	// Compare target byte with each byte in data.
+	PCMPEQB	X0, X1
+	// Move result bits to integer register.
+	PMOVMSKB X1, DX
+	// Apply mask
+	ANDQ R10, DX
+	// Directly return DX, we don't need to accumulate
+	// since we have <16 bytes.
+	POPCNTL DX, DX
+	MOVQ	DX, (R8)
+	RET
+
+avx2:
+	CMPB   runtime·support_avx2(SB), $1
+	JNE sse
+	MOVD AX, X0
+	LEAQ -32(SI)(BX*1), R11
+	VPBROADCASTB  X0, Y1
+avx2_loop:
+	VMOVDQU (DI), Y2
+	VPCMPEQB Y1, Y2, Y3
+	VPMOVMSKB Y3, DX
+	POPCNTL DX, DX
+	ADDQ DX, R12
+	ADDQ $32, DI
+	CMPQ DI, R11
+	JLE avx2_loop
+
+	// If last block is already processed,
+	// skip to the end.
+	CMPQ DI, R11
+	JEQ endavx
+
+	// Load address of the last 32 bytes.
+	// There is an overlap with the previous block.
+	MOVQ R11, DI
+	VMOVDQU (DI), Y2
+	VPCMPEQB Y1, Y2, Y3
+	VPMOVMSKB Y3, DX
+	// Exit AVX mode.
+	VZEROUPPER
+
+	// Create mask to ignore overlap between previous 32 byte block
+	// and the next.
+	ANDQ $31, BX
+	MOVQ $32,CX
+	SUBQ BX, CX
+	MOVQ $0xFFFFFFFF, R10
+	SARQ CL, R10
+	SALQ CL, R10
+	// Apply mask
+	ANDQ R10, DX
+	POPCNTL DX, DX
+	ADDQ DX, R12
+	MOVQ R12, (R8)
+	RET
+endavx:
+	// Exit AVX mode.
+	VZEROUPPER
+	MOVQ R12, (R8)
 	RET
 
 TEXT runtime·return0(SB), NOSPLIT, $0
@@ -2160,26 +2363,6 @@ TEXT runtime·goexit(SB),NOSPLIT,$0-0
 	// traceback from goexit1 must hit code range of goexit
 	BYTE	$0x90	// NOP
 
-TEXT runtime·prefetcht0(SB),NOSPLIT,$0-8
-	MOVQ	addr+0(FP), AX
-	PREFETCHT0	(AX)
-	RET
-
-TEXT runtime·prefetcht1(SB),NOSPLIT,$0-8
-	MOVQ	addr+0(FP), AX
-	PREFETCHT1	(AX)
-	RET
-
-TEXT runtime·prefetcht2(SB),NOSPLIT,$0-8
-	MOVQ	addr+0(FP), AX
-	PREFETCHT2	(AX)
-	RET
-
-TEXT runtime·prefetchnta(SB),NOSPLIT,$0-8
-	MOVQ	addr+0(FP), AX
-	PREFETCHNTA	(AX)
-	RET
-
 // This is called from .init_array and follows the platform, not Go, ABI.
 TEXT runtime·addmoduledata(SB),NOSPLIT,$0-0
 	PUSHQ	R15 // The access to global variables below implicitly uses R15, which is callee-save
@@ -2188,3 +2371,87 @@ TEXT runtime·addmoduledata(SB),NOSPLIT,$0-0
 	MOVQ	DI, runtime·lastmoduledatap(SB)
 	POPQ	R15
 	RET
+
+// gcWriteBarrier performs a heap pointer write and informs the GC.
+//
+// gcWriteBarrier does NOT follow the Go ABI. It takes two arguments:
+// - DI is the destination of the write
+// - AX is the value being written at DI
+// It clobbers FLAGS. It does not clobber any general-purpose registers,
+// but may clobber others (e.g., SSE registers).
+TEXT runtime·gcWriteBarrier(SB),NOSPLIT,$120
+	// Save the registers clobbered by the fast path. This is slightly
+	// faster than having the caller spill these.
+	MOVQ	R14, 104(SP)
+	MOVQ	R13, 112(SP)
+	// TODO: Consider passing g.m.p in as an argument so they can be shared
+	// across a sequence of write barriers.
+	get_tls(R13)
+	MOVQ	g(R13), R13
+	MOVQ	g_m(R13), R13
+	MOVQ	m_p(R13), R13
+	MOVQ	(p_wbBuf+wbBuf_next)(R13), R14
+	// Increment wbBuf.next position.
+	LEAQ	16(R14), R14
+	MOVQ	R14, (p_wbBuf+wbBuf_next)(R13)
+	CMPQ	R14, (p_wbBuf+wbBuf_end)(R13)
+	// Record the write.
+	MOVQ	AX, -16(R14)	// Record value
+	MOVQ	(DI), R13	// TODO: This turns bad writes into bad reads.
+	MOVQ	R13, -8(R14)	// Record *slot
+	// Is the buffer full? (flags set in CMPQ above)
+	JEQ	flush
+ret:
+	MOVQ	104(SP), R14
+	MOVQ	112(SP), R13
+	// Do the write.
+	MOVQ	AX, (DI)
+	RET
+
+flush:
+	// Save all general purpose registers since these could be
+	// clobbered by wbBufFlush and were not saved by the caller.
+	// It is possible for wbBufFlush to clobber other registers
+	// (e.g., SSE registers), but the compiler takes care of saving
+	// those in the caller if necessary. This strikes a balance
+	// with registers that are likely to be used.
+	//
+	// We don't have type information for these, but all code under
+	// here is NOSPLIT, so nothing will observe these.
+	//
+	// TODO: We could strike a different balance; e.g., saving X0
+	// and not saving GP registers that are less likely to be used.
+	MOVQ	DI, 0(SP)	// Also first argument to wbBufFlush
+	MOVQ	AX, 8(SP)	// Also second argument to wbBufFlush
+	MOVQ	BX, 16(SP)
+	MOVQ	CX, 24(SP)
+	MOVQ	DX, 32(SP)
+	// DI already saved
+	MOVQ	SI, 40(SP)
+	MOVQ	BP, 48(SP)
+	MOVQ	R8, 56(SP)
+	MOVQ	R9, 64(SP)
+	MOVQ	R10, 72(SP)
+	MOVQ	R11, 80(SP)
+	MOVQ	R12, 88(SP)
+	// R13 already saved
+	// R14 already saved
+	MOVQ	R15, 96(SP)
+
+	// This takes arguments DI and AX
+	CALL	runtime·wbBufFlush(SB)
+
+	MOVQ	0(SP), DI
+	MOVQ	8(SP), AX
+	MOVQ	16(SP), BX
+	MOVQ	24(SP), CX
+	MOVQ	32(SP), DX
+	MOVQ	40(SP), SI
+	MOVQ	48(SP), BP
+	MOVQ	56(SP), R8
+	MOVQ	64(SP), R9
+	MOVQ	72(SP), R10
+	MOVQ	80(SP), R11
+	MOVQ	88(SP), R12
+	MOVQ	96(SP), R15
+	JMP	ret

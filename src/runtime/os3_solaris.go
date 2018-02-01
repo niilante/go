@@ -181,6 +181,12 @@ func newosproc(mp *m, _ unsafe.Pointer) {
 	}
 }
 
+func exitThread(wait *uint32) {
+	// We should never reach exitThread on Solaris because we let
+	// libc clean up threads.
+	throw("exitThread")
+}
+
 var urandom_dev = []byte("/dev/urandom\x00")
 
 //go:nosplit
@@ -317,7 +323,7 @@ func semacreate(mp *m) {
 	// here because it could cause a deadlock.
 	_g_.m.libcall.fn = uintptr(unsafe.Pointer(&libc_malloc))
 	_g_.m.libcall.n = 1
-	memclr(unsafe.Pointer(&_g_.m.scratch), uintptr(len(_g_.m.scratch.v)))
+	_g_.m.scratch = mscratch{}
 	_g_.m.scratch.v[0] = unsafe.Sizeof(*sem)
 	_g_.m.libcall.args = uintptr(unsafe.Pointer(&_g_.m.scratch))
 	asmcgocall(unsafe.Pointer(&asmsysvicall6), unsafe.Pointer(&_g_.m.libcall))
@@ -337,7 +343,7 @@ func semasleep(ns int64) int32 {
 
 		_m_.libcall.fn = uintptr(unsafe.Pointer(&libc_sem_reltimedwait_np))
 		_m_.libcall.n = 2
-		memclr(unsafe.Pointer(&_m_.scratch), uintptr(len(_m_.scratch.v)))
+		_m_.scratch = mscratch{}
 		_m_.scratch.v[0] = _m_.waitsema
 		_m_.scratch.v[1] = uintptr(unsafe.Pointer(&_m_.ts))
 		_m_.libcall.args = uintptr(unsafe.Pointer(&_m_.scratch))
@@ -353,7 +359,7 @@ func semasleep(ns int64) int32 {
 	for {
 		_m_.libcall.fn = uintptr(unsafe.Pointer(&libc_sem_wait))
 		_m_.libcall.n = 1
-		memclr(unsafe.Pointer(&_m_.scratch), uintptr(len(_m_.scratch.v)))
+		_m_.scratch = mscratch{}
 		_m_.scratch.v[0] = _m_.waitsema
 		_m_.libcall.args = uintptr(unsafe.Pointer(&_m_.scratch))
 		asmcgocall(unsafe.Pointer(&asmsysvicall6), unsafe.Pointer(&_m_.libcall))
@@ -396,12 +402,12 @@ func madvise(addr unsafe.Pointer, n uintptr, flags int32) {
 }
 
 //go:nosplit
-func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) unsafe.Pointer {
+func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (unsafe.Pointer, int) {
 	p, err := doMmap(uintptr(addr), n, uintptr(prot), uintptr(flags), uintptr(fd), uintptr(off))
 	if p == ^uintptr(0) {
-		return unsafe.Pointer(err)
+		return nil, int(err)
 	}
-	return unsafe.Pointer(p)
+	return unsafe.Pointer(p), 0
 }
 
 //go:nosplit

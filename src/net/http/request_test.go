@@ -7,6 +7,7 @@ package http_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -365,18 +366,68 @@ func TestFormFileOrder(t *testing.T) {
 
 var readRequestErrorTests = []struct {
 	in  string
-	err error
+	err string
+
+	header Header
 }{
-	{"GET / HTTP/1.1\r\nheader:foo\r\n\r\n", nil},
-	{"GET / HTTP/1.1\r\nheader:foo\r\n", io.ErrUnexpectedEOF},
-	{"", io.EOF},
+	0: {"GET / HTTP/1.1\r\nheader:foo\r\n\r\n", "", Header{"Header": {"foo"}}},
+	1: {"GET / HTTP/1.1\r\nheader:foo\r\n", io.ErrUnexpectedEOF.Error(), nil},
+	2: {"", io.EOF.Error(), nil},
+	3: {
+		in:  "HEAD / HTTP/1.1\r\nContent-Length:4\r\n\r\n",
+		err: "http: method cannot contain a Content-Length",
+	},
+	4: {
+		in:     "HEAD / HTTP/1.1\r\n\r\n",
+		header: Header{},
+	},
+
+	// Multiple Content-Length values should either be
+	// deduplicated if same or reject otherwise
+	// See Issue 16490.
+	5: {
+		in:  "POST / HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 0\r\n\r\nGopher hey\r\n",
+		err: "cannot contain multiple Content-Length headers",
+	},
+	6: {
+		in:  "POST / HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 6\r\n\r\nGopher\r\n",
+		err: "cannot contain multiple Content-Length headers",
+	},
+	7: {
+		in:     "PUT / HTTP/1.1\r\nContent-Length: 6 \r\nContent-Length: 6\r\nContent-Length:6\r\n\r\nGopher\r\n",
+		err:    "",
+		header: Header{"Content-Length": {"6"}},
+	},
+	8: {
+		in:  "PUT / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 6 \r\n\r\n",
+		err: "cannot contain multiple Content-Length headers",
+	},
+	9: {
+		in:  "POST / HTTP/1.1\r\nContent-Length:\r\nContent-Length: 3\r\n\r\n",
+		err: "cannot contain multiple Content-Length headers",
+	},
+	10: {
+		in:     "HEAD / HTTP/1.1\r\nContent-Length:0\r\nContent-Length: 0\r\n\r\n",
+		header: Header{"Content-Length": {"0"}},
+	},
 }
 
 func TestReadRequestErrors(t *testing.T) {
 	for i, tt := range readRequestErrorTests {
-		_, err := ReadRequest(bufio.NewReader(strings.NewReader(tt.in)))
-		if err != tt.err {
-			t.Errorf("%d. got error = %v; want %v", i, err, tt.err)
+		req, err := ReadRequest(bufio.NewReader(strings.NewReader(tt.in)))
+		if err == nil {
+			if tt.err != "" {
+				t.Errorf("#%d: got nil err; want %q", i, tt.err)
+			}
+
+			if !reflect.DeepEqual(tt.header, req.Header) {
+				t.Errorf("#%d: gotHeader: %q wantHeader: %q", i, req.Header, tt.header)
+			}
+			continue
+		}
+
+		if tt.err == "" || !strings.Contains(err.Error(), tt.err) {
+			t.Errorf("%d: got error = %v; want %v", i, err, tt.err)
 		}
 	}
 }
@@ -447,18 +498,23 @@ func TestNewRequestContentLength(t *testing.T) {
 		{bytes.NewReader([]byte("123")), 3},
 		{bytes.NewBuffer([]byte("1234")), 4},
 		{strings.NewReader("12345"), 5},
-		// Not detected:
+		{strings.NewReader(""), 0},
+		{NoBody, 0},
+
+		// Not detected. During Go 1.8 we tried to make these set to -1, but
+		// due to Issue 18117, we keep these returning 0, even though they're
+		// unknown.
 		{struct{ io.Reader }{strings.NewReader("xyz")}, 0},
 		{io.NewSectionReader(strings.NewReader("x"), 0, 6), 0},
 		{readByte(io.NewSectionReader(strings.NewReader("xy"), 0, 6)), 0},
 	}
-	for _, tt := range tests {
+	for i, tt := range tests {
 		req, err := NewRequest("POST", "http://localhost/", tt.r)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if req.ContentLength != tt.want {
-			t.Errorf("ContentLength(%T) = %d; want %d", tt.r, req.ContentLength, tt.want)
+			t.Errorf("test[%d]: ContentLength(%T) = %d; want %d", i, tt.r, req.ContentLength, tt.want)
 		}
 	}
 }
@@ -617,11 +673,31 @@ func TestStarRequest(t *testing.T) {
 	if err != nil {
 		return
 	}
+	if req.ContentLength != 0 {
+		t.Errorf("ContentLength = %d; want 0", req.ContentLength)
+	}
+	if req.Body == nil {
+		t.Errorf("Body = nil; want non-nil")
+	}
+
+	// Request.Write has Client semantics for Body/ContentLength,
+	// where ContentLength 0 means unknown if Body is non-nil, and
+	// thus chunking will happen unless we change semantics and
+	// signal that we want to serialize it as exactly zero.  The
+	// only way to do that for outbound requests is with a nil
+	// Body:
+	clientReq := *req
+	clientReq.Body = nil
+
 	var out bytes.Buffer
-	if err := req.Write(&out); err != nil {
+	if err := clientReq.Write(&out); err != nil {
 		t.Fatal(err)
 	}
-	back, err := ReadRequest(bufio.NewReader(&out))
+
+	if strings.Contains(out.String(), "chunked") {
+		t.Error("wrote chunked request; want no body")
+	}
+	back, err := ReadRequest(bufio.NewReader(bytes.NewReader(out.Bytes())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -706,6 +782,69 @@ func TestMaxBytesReaderStickyError(t *testing.T) {
 		rc := MaxBytesReader(nil, ioutil.NopCloser(bytes.NewReader(make([]byte, tt.readable))), tt.limit)
 		if err := isSticky(rc); err != nil {
 			t.Errorf("%d. error: %v", i, err)
+		}
+	}
+}
+
+func TestWithContextDeepCopiesURL(t *testing.T) {
+	req, err := NewRequest("POST", "https://golang.org/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reqCopy := req.WithContext(context.Background())
+	reqCopy.URL.Scheme = "http"
+
+	firstURL, secondURL := req.URL.String(), reqCopy.URL.String()
+	if firstURL == secondURL {
+		t.Errorf("unexpected change to original request's URL")
+	}
+
+	// And also check we don't crash on nil (Issue 20601)
+	req.URL = nil
+	reqCopy = req.WithContext(context.Background())
+	if reqCopy.URL != nil {
+		t.Error("expected nil URL in cloned request")
+	}
+}
+
+// verify that NewRequest sets Request.GetBody and that it works
+func TestNewRequestGetBody(t *testing.T) {
+	tests := []struct {
+		r io.Reader
+	}{
+		{r: strings.NewReader("hello")},
+		{r: bytes.NewReader([]byte("hello"))},
+		{r: bytes.NewBuffer([]byte("hello"))},
+	}
+	for i, tt := range tests {
+		req, err := NewRequest("POST", "http://foo.tld/", tt.r)
+		if err != nil {
+			t.Errorf("test[%d]: %v", i, err)
+			continue
+		}
+		if req.Body == nil {
+			t.Errorf("test[%d]: Body = nil", i)
+			continue
+		}
+		if req.GetBody == nil {
+			t.Errorf("test[%d]: GetBody = nil", i)
+			continue
+		}
+		slurp1, err := ioutil.ReadAll(req.Body)
+		if err != nil {
+			t.Errorf("test[%d]: ReadAll(Body) = %v", i, err)
+		}
+		newBody, err := req.GetBody()
+		if err != nil {
+			t.Errorf("test[%d]: GetBody = %v", i, err)
+		}
+		slurp2, err := ioutil.ReadAll(newBody)
+		if err != nil {
+			t.Errorf("test[%d]: ReadAll(GetBody()) = %v", i, err)
+		}
+		if string(slurp1) != string(slurp2) {
+			t.Errorf("test[%d]: Body %q != GetBody %q", i, slurp1, slurp2)
 		}
 	}
 }

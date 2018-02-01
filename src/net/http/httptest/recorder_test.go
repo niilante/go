@@ -23,7 +23,15 @@ func TestRecorder(t *testing.T) {
 			return nil
 		}
 	}
-	hasResultStatus := func(wantCode int) checkFunc {
+	hasResultStatus := func(want string) checkFunc {
+		return func(rec *ResponseRecorder) error {
+			if rec.Result().Status != want {
+				return fmt.Errorf("Result().Status = %q; want %q", rec.Result().Status, want)
+			}
+			return nil
+		}
+	}
+	hasResultStatusCode := func(wantCode int) checkFunc {
 		return func(rec *ResponseRecorder) error {
 			if rec.Result().StatusCode != wantCode {
 				return fmt.Errorf("Result().StatusCode = %d; want %d", rec.Result().StatusCode, wantCode)
@@ -207,6 +215,7 @@ func TestRecorder(t *testing.T) {
 				w.Header().Set("Trailer-A", "valuea")
 				w.Header().Set("Trailer-C", "valuec")
 				w.Header().Set("Trailer-NotDeclared", "should be omitted")
+				w.Header().Set("Trailer:Trailer-D", "with prefix")
 			},
 			check(
 				hasStatus(200),
@@ -216,6 +225,7 @@ func TestRecorder(t *testing.T) {
 				hasTrailer("Trailer-A", "valuea"),
 				hasTrailer("Trailer-C", "valuec"),
 				hasNotTrailers("Non-Trailer", "Trailer-B", "Trailer-NotDeclared"),
+				hasTrailer("Trailer-D", "with prefix"),
 			),
 		},
 		{
@@ -233,7 +243,8 @@ func TestRecorder(t *testing.T) {
 				hasOldHeader("X-Foo", "1"),
 				hasStatus(0),
 				hasHeader("X-Foo", "1"),
-				hasResultStatus(200),
+				hasResultStatus("200 OK"),
+				hasResultStatusCode(200),
 			),
 		},
 		{

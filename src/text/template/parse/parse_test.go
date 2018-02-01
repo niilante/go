@@ -218,6 +218,12 @@ var parseTests = []parseTest{
 		`{{range $x := .SI}}{{.}}{{end}}`},
 	{"range 2 vars", "{{range $x, $y := .SI}}{{.}}{{end}}", noError,
 		`{{range $x, $y := .SI}}{{.}}{{end}}`},
+	{"range []int with break", "{{range .SI}}{{break}}{{.}}{{end}}", noError,
+		`{{range .SI}}{{break}}{{.}}{{end}}`},
+	{"range []int with break in else", "{{range .SI}}{{range .SI}}{{.}}{{else}}{{break}}{{end}}{{end}}", noError,
+		`{{range .SI}}{{range .SI}}{{.}}{{else}}{{break}}{{end}}{{end}}`},
+	{"range []int with continue", "{{range .SI}}{{continue}}{{.}}{{end}}", noError,
+		`{{range .SI}}{{continue}}{{.}}{{end}}`},
 	{"constants", "{{range .SI 1 -3.2i true false 'a' nil}}{{end}}", noError,
 		`{{range .SI 1 -3.2i true false 'a' nil}}{{end}}`},
 	{"template", "{{template `x`}}", noError,
@@ -288,6 +294,12 @@ var parseTests = []parseTest{
 	{"empty pipeline", `{{printf "%d" ( ) }}`, hasError, ""},
 	// Missing pipeline in block
 	{"block definition", `{{block "foo"}}hello{{end}}`, hasError, ""},
+	// Invalid range control
+	{"break outside of range", `{{break}}`, hasError, ""},
+	{"break in range else, outside of range", `{{range .}}{{.}}{{else}}{{break}}{{end}}`, hasError, ""},
+	{"continue outside of range", `{{continue}}`, hasError, ""},
+	{"continue in range else, outside of range", `{{range .}}{{.}}{{else}}{{continue}}{{end}}`, hasError, ""},
+	{"additional break data", `{{range .}}{{break label}}{{end}}`, hasError, ""},
 }
 
 var builtins = map[string]interface{}{
@@ -482,5 +494,39 @@ func TestBlock(t *testing.T) {
 	}
 	if g, w := inTmpl.Root.String(), inner; g != w {
 		t.Errorf("inner template = %q, want %q", g, w)
+	}
+}
+
+func TestLineNum(t *testing.T) {
+	const count = 100
+	text := strings.Repeat("{{printf 1234}}\n", count)
+	tree, err := New("bench").Parse(text, "", "", make(map[string]*Tree), builtins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Check the line numbers. Each line is an action containing a template, followed by text.
+	// That's two nodes per line.
+	nodes := tree.Root.Nodes
+	for i := 0; i < len(nodes); i += 2 {
+		line := 1 + i/2
+		// Action first.
+		action := nodes[i].(*ActionNode)
+		if action.Line != line {
+			t.Fatalf("line %d: action is line %d", line, action.Line)
+		}
+		pipe := action.Pipe
+		if pipe.Line != line {
+			t.Fatalf("line %d: pipe is line %d", line, pipe.Line)
+		}
+	}
+}
+
+func BenchmarkParseLarge(b *testing.B) {
+	text := strings.Repeat("{{1234}}\n", 10000)
+	for i := 0; i < b.N; i++ {
+		_, err := New("bench").Parse(text, "", "", make(map[string]*Tree), builtins)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }

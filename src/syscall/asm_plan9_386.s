@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// TODO(rsc): Rewrite all nn(SP) references into name+(nn-8)(FP)
-// so that go vet can check that they are correct.
-
 #include "textflag.h"
 #include "funcdata.h"
 
@@ -22,8 +19,8 @@ TEXT	·Syscall(SB),NOSPLIT,$0-32
 	CALL	runtime·entersyscall(SB)
 	MOVL	trap+0(FP), AX	// syscall entry
 	// slide args down on top of system call number
-	LEAL	8(SP), SI
-	LEAL	4(SP), DI
+	LEAL	a1+4(FP), SI
+	LEAL	trap+0(FP), DI
 	CLD
 	MOVSL
 	MOVSL
@@ -41,7 +38,7 @@ TEXT	·Syscall(SB),NOSPLIT,$0-32
 	JMP	copyresult3
 	
 ok3:
-	LEAL	runtime·emptystring(SB), SI	
+	LEAL	·emptystring(SB), SI
 	
 copyresult3:
 	LEAL	err+24(FP), DI
@@ -57,8 +54,8 @@ TEXT	·Syscall6(SB),NOSPLIT,$0-44
 	CALL	runtime·entersyscall(SB)
 	MOVL	trap+0(FP), AX	// syscall entry
 	// slide args down on top of system call number
-	LEAL	8(SP), SI
-	LEAL	4(SP), DI
+	LEAL	a1+4(FP), SI
+	LEAL	trap+0(FP), DI
 	CLD
 	MOVSL
 	MOVSL
@@ -79,7 +76,7 @@ TEXT	·Syscall6(SB),NOSPLIT,$0-44
 	JMP	copyresult4
 	
 ok4:
-	LEAL	runtime·emptystring(SB), SI
+	LEAL	·emptystring(SB), SI
 	
 copyresult4:
 	LEAL	err+36(FP), DI
@@ -94,8 +91,8 @@ copyresult4:
 TEXT ·RawSyscall(SB),NOSPLIT,$0-28
 	MOVL	trap+0(FP), AX	// syscall entry
 	// slide args down on top of system call number
-	LEAL	8(SP), SI
-	LEAL	4(SP), DI
+	LEAL	a1+4(FP), SI
+	LEAL	trap+0(FP), DI
 	CLD
 	MOVSL
 	MOVSL
@@ -109,8 +106,8 @@ TEXT ·RawSyscall(SB),NOSPLIT,$0-28
 TEXT	·RawSyscall6(SB),NOSPLIT,$0-40
 	MOVL	trap+0(FP), AX	// syscall entry
 	// slide args down on top of system call number
-	LEAL	8(SP), SI
-	LEAL	4(SP), DI
+	LEAL	a1+4(FP), SI
+	LEAL	trap+0(FP), DI
 	CLD
 	MOVSL
 	MOVSL
@@ -146,7 +143,7 @@ TEXT ·seek(SB),NOSPLIT,$0-36
 	JMP	copyresult6
 	
 ok6:
-	LEAL	runtime·emptystring(SB), SI
+	LEAL	·emptystring(SB), SI
 	
 copyresult6:
 	LEAL	err+28(FP), DI
@@ -154,13 +151,4 @@ copyresult6:
 	CLD
 	MOVSL
 	MOVSL
-	RET
-
-//func exit(code int)
-// Import runtime·exit for cleanly exiting.
-TEXT ·exit(SB),NOSPLIT,$4-4
-	NO_LOCAL_POINTERS
-	MOVL	code+0(FP), AX
-	MOVL	AX, 0(SP)
-	CALL	runtime·exit(SB)
 	RET

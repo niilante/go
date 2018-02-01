@@ -56,11 +56,20 @@ var writeSetCookiesTests = []struct {
 		&Cookie{Name: "cookie-9", Value: "expiring", Expires: time.Unix(1257894000, 0)},
 		"cookie-9=expiring; Expires=Tue, 10 Nov 2009 23:00:00 GMT",
 	},
+	// According to IETF 6265 Section 5.1.1.5, the year cannot be less than 1601
+	{
+		&Cookie{Name: "cookie-10", Value: "expiring-1601", Expires: time.Date(1601, 1, 1, 1, 1, 1, 1, time.UTC)},
+		"cookie-10=expiring-1601; Expires=Mon, 01 Jan 1601 01:01:01 GMT",
+	},
+	{
+		&Cookie{Name: "cookie-11", Value: "invalid-expiry", Expires: time.Date(1600, 1, 1, 1, 1, 1, 1, time.UTC)},
+		"cookie-11=invalid-expiry",
+	},
 	// The "special" cookies have values containing commas or spaces which
 	// are disallowed by RFC 6265 but are common in the wild.
 	{
 		&Cookie{Name: "special-1", Value: "a z"},
-		`special-1=a z`,
+		`special-1="a z"`,
 	},
 	{
 		&Cookie{Name: "special-2", Value: " z"},
@@ -76,7 +85,7 @@ var writeSetCookiesTests = []struct {
 	},
 	{
 		&Cookie{Name: "special-5", Value: "a,z"},
-		`special-5=a,z`,
+		`special-5="a,z"`,
 	},
 	{
 		&Cookie{Name: "special-6", Value: ",z"},
@@ -389,9 +398,12 @@ func TestCookieSanitizeValue(t *testing.T) {
 		{"foo\"bar", "foobar"},
 		{"\x00\x7e\x7f\x80", "\x7e"},
 		{`"withquotes"`, "withquotes"},
-		{"a z", "a z"},
+		{"a z", `"a z"`},
 		{" z", `" z"`},
 		{"a ", `"a "`},
+		{"a,z", `"a,z"`},
+		{",z", `",z"`},
+		{"a,", `"a,"`},
 	}
 	for _, tt := range tests {
 		if got := sanitizeCookieValue(tt.in); got != tt.want {

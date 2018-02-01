@@ -4,57 +4,20 @@
 
 #include "textflag.h"
 
-// func hasAsm() bool
-TEXT ·hasAsm(SB),NOSPLIT,$16-1
-	XOR	R0, R0          // set function code to 0 (query)
-	LA	mask-16(SP), R1 // 16-byte stack variable for mask
-	MOVD	$(0x38<<40), R3 // mask for bits 18-20 (big endian)
-
-	// check for KM AES functions
-	WORD	$0xB92E0024 // cipher message (KM)
-	MOVD	mask-16(SP), R2
-	AND	R3, R2
-	CMPBNE	R2, R3, notfound
-
-	// check for KMC AES functions
-	WORD	$0xB92F0024 // cipher message with chaining (KMC)
-	MOVD	mask-16(SP), R2
-	AND	R3, R2
-	CMPBNE	R2, R3, notfound
-
-	// check for KMCTR AES functions
-	WORD	$0xB92D4024 // cipher message with counter (KMCTR)
-	MOVD	mask-16(SP), R2
-	AND	R3, R2
-	CMPBNE	R2, R3, notfound
-
-	// check for KIMD GHASH function
-	WORD	$0xB93E0024    // compute intermediate message digest (KIMD)
-	MOVD	mask-8(SP), R2 // bits 64-127
-	MOVD	$(1<<62), R5
-	AND	R5, R2
-	CMPBNE	R2, R5, notfound
-
-	MOVB	$1, ret+0(FP)
-	RET
-notfound:
-	MOVB	$0, ret+0(FP)
-	RET
-
-// func cryptBlocks(function code, key, dst, src *byte, length int)
+// func cryptBlocks(c code, key, dst, src *byte, length int)
 TEXT ·cryptBlocks(SB),NOSPLIT,$0-40
 	MOVD	key+8(FP), R1
 	MOVD	dst+16(FP), R2
 	MOVD	src+24(FP), R4
 	MOVD	length+32(FP), R5
-	MOVD	function+0(FP), R0
+	MOVD	c+0(FP), R0
 loop:
 	WORD	$0xB92E0024 // cipher message (KM)
 	BVS	loop        // branch back if interrupted
 	XOR	R0, R0
 	RET
 
-// func cryptBlocksChain(function code, iv, key, dst, src *byte, length int)
+// func cryptBlocksChain(c code, iv, key, dst, src *byte, length int)
 TEXT ·cryptBlocksChain(SB),NOSPLIT,$48-48
 	LA	params-48(SP), R1
 	MOVD	iv+8(FP), R8
@@ -64,7 +27,7 @@ TEXT ·cryptBlocksChain(SB),NOSPLIT,$48-48
 	MOVD	dst+24(FP), R2
 	MOVD	src+32(FP), R4
 	MOVD	length+40(FP), R5
-	MOVD	function+0(FP), R0
+	MOVD	c+0(FP), R0
 loop:
 	WORD	$0xB92F0024       // cipher message with chaining (KMC)
 	BVS	loop              // branch back if interrupted
@@ -186,4 +149,66 @@ loop:
 	BVS     loop        // branch back if interrupted
 	MVC     $16, (R1), (R8)
 	MOVD	$0, R0
+	RET
+
+// func supportsKMA() bool
+TEXT ·supportsKMA(SB),NOSPLIT,$24-1
+	MOVD	$tmp-24(SP), R1
+	MOVD	$2, R0       // store 24-bytes
+	XC	$24, (R1), (R1)
+	WORD	$0xb2b01000  // STFLE (R1)
+	MOVWZ	16(R1), R2
+	ANDW	$(1<<13), R2 // test bit 146 (message-security-assist 8)
+	BEQ	no
+
+	MOVD	$0, R0       // KMA-Query
+	XC	$16, (R1), (R1)
+	WORD	$0xb9296024  // kma %r6,%r2,%r4
+	MOVWZ	(R1), R2
+	WORD	$0xa7213800  // TMLL R2, $0x3800
+	BVS	yes
+no:
+	MOVB	$0, ret+0(FP)
+	RET
+yes:
+	MOVB	$1, ret+0(FP)
+	RET
+
+// func kmaGCM(fn code, key, dst, src, aad []byte, tag *[16]byte, cnt *gcmCount)
+TEXT ·kmaGCM(SB),NOSPLIT,$112-120
+	MOVD	fn+0(FP), R0
+	MOVD	$params-112(SP), R1
+
+	// load ptr/len pairs
+	LMG	dst+32(FP), R2, R3 // R2=base R3=len
+	LMG	src+56(FP), R4, R5 // R4=base R5=len
+	LMG	aad+80(FP), R6, R7 // R6=base R7=len
+
+	// setup parameters
+	MOVD	cnt+112(FP), R8
+	XC	$12, (R1), (R1)     // reserved
+	MVC	$4, 12(R8), 12(R1)  // set chain value
+	MVC	$16, (R8), 64(R1)   // set initial counter value
+	XC	$32, 16(R1), 16(R1) // set hash subkey and tag
+	SLD	$3, R7, R12
+	MOVD	R12, 48(R1)         // set total AAD length
+	SLD	$3, R5, R12
+	MOVD	R12, 56(R1)         // set total plaintext/ciphertext length
+
+	LMG	key+8(FP), R8, R9   // R8=base R9=len
+	MVC	$16, (R8), 80(R1)   // set key
+	CMPBEQ	R9, $16, kma
+	MVC	$8, 16(R8), 96(R1)
+	CMPBEQ	R9, $24, kma
+	MVC	$8, 24(R8), 104(R1)
+
+kma:
+	WORD	$0xb9296024 // kma %r6,%r2,%r4
+	BVS	kma
+
+	MOVD	tag+104(FP), R2
+	MVC	$16, 16(R1), 0(R2) // copy tag to output
+	MOVD	cnt+112(FP), R8
+	MVC	$4, 12(R1), 12(R8) // update counter value
+
 	RET

@@ -10,10 +10,12 @@ import (
 	"internal/syscall/windows/sysdll"
 	"internal/testenv"
 	"io/ioutil"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -536,6 +538,17 @@ func TestWERDialogue(t *testing.T) {
 	cmd.CombinedOutput()
 }
 
+func TestWindowsStackMemory(t *testing.T) {
+	o := runTestProg(t, "testprog", "StackMemory")
+	stackUsage, err := strconv.Atoi(o)
+	if err != nil {
+		t.Fatalf("Failed to read stack usage: %v", err)
+	}
+	if expected, got := 100<<10, stackUsage; got > expected {
+		t.Fatalf("expected < %d bytes of memory per thread, got %d", expected, got)
+	}
+}
+
 var used byte
 
 func use(buf []byte) {
@@ -619,6 +632,61 @@ uintptr_t cfunc(callback f, uintptr_t n) {
 	want := result{r: 100, err: 333}
 	if got := <-c; got != want {
 		t.Errorf("got %d want %d", got, want)
+	}
+}
+
+func TestFloatArgs(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("skipping test: gcc is missing")
+	}
+	if runtime.GOARCH != "amd64" {
+		t.Skipf("skipping test: GOARCH=%s", runtime.GOARCH)
+	}
+
+	const src = `
+#include <stdint.h>
+#include <windows.h>
+
+uintptr_t cfunc(uintptr_t a, double b, float c, double d) {
+	if (a == 1 && b == 2.2 && c == 3.3f && d == 4.4e44) {
+		return 1;
+	}
+	return 0;
+}
+`
+	tmpdir, err := ioutil.TempDir("", "TestFloatArgs")
+	if err != nil {
+		t.Fatal("TempDir failed: ", err)
+	}
+	defer os.RemoveAll(tmpdir)
+
+	srcname := "mydll.c"
+	err = ioutil.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outname := "mydll.dll"
+	cmd := exec.Command("gcc", "-shared", "-s", "-Werror", "-o", outname, srcname)
+	cmd.Dir = tmpdir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to build dll: %v - %v", err, string(out))
+	}
+	dllpath := filepath.Join(tmpdir, outname)
+
+	dll := syscall.MustLoadDLL(dllpath)
+	defer dll.Release()
+
+	proc := dll.MustFindProc("cfunc")
+
+	r, _, err := proc.Call(
+		1,
+		uintptr(math.Float64bits(2.2)),
+		uintptr(math.Float32bits(3.3)),
+		uintptr(math.Float64bits(4.4e44)),
+	)
+	if r != 1 {
+		t.Errorf("got %d want 1 (err=%v)", r, err)
 	}
 }
 
@@ -981,13 +1049,13 @@ func BenchmarkRunningGoProgram(b *testing.B) {
 	defer os.RemoveAll(tmpdir)
 
 	src := filepath.Join(tmpdir, "main.go")
-	err = ioutil.WriteFile(src, []byte(benchmarkRunnigGoProgram), 0666)
+	err = ioutil.WriteFile(src, []byte(benchmarkRunningGoProgram), 0666)
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	exe := filepath.Join(tmpdir, "main.exe")
-	cmd := exec.Command("go", "build", "-o", exe, src)
+	cmd := exec.Command(testenv.GoToolPath(b), "build", "-o", exe, src)
 	cmd.Dir = tmpdir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -999,13 +1067,15 @@ func BenchmarkRunningGoProgram(b *testing.B) {
 		cmd := exec.Command(exe)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			b.Fatalf("runing main.exe failed: %v\n%s", err, out)
+			b.Fatalf("running main.exe failed: %v\n%s", err, out)
 		}
 	}
 }
 
-const benchmarkRunnigGoProgram = `
+const benchmarkRunningGoProgram = `
 package main
+
+import _ "os" // average Go program will use "os" package, do the same here
 
 func main() {
 }

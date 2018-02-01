@@ -5,20 +5,22 @@
 package os_test
 
 import (
-	"bytes"
-	"encoding/hex"
 	"fmt"
+	"internal/poll"
 	"internal/syscall/windows"
 	"internal/testenv"
+	"io"
 	"io/ioutil"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
 	"syscall"
 	"testing"
+	"unicode/utf16"
 	"unsafe"
 )
 
@@ -103,6 +105,10 @@ func testDirLinks(t *testing.T, tests []dirLinkTest) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	err = ioutil.WriteFile(filepath.Join(dir, "abc"), []byte("abc"), 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -111,7 +117,7 @@ func testDirLinks(t *testing.T, tests []dirLinkTest) {
 		link := filepath.Join(tmpdir, test.name+"_link")
 		err := test.mklink(link, dir)
 		if err != nil {
-			t.Errorf("creating link for %s test failed: %v", test.name, err)
+			t.Errorf("creating link for %q test failed: %v", test.name, err)
 			continue
 		}
 
@@ -130,15 +136,35 @@ func testDirLinks(t *testing.T, tests []dirLinkTest) {
 			continue
 		}
 
-		fi, err := os.Stat(link)
+		fi1, err := os.Stat(link)
 		if err != nil {
 			t.Errorf("failed to stat link %v: %v", link, err)
 			continue
 		}
-		expected := filepath.Base(dir)
-		got := fi.Name()
-		if !fi.IsDir() || expected != got {
-			t.Errorf("link should point to %v but points to %v instead", expected, got)
+		if !fi1.IsDir() {
+			t.Errorf("%q should be a directory", link)
+			continue
+		}
+		if fi1.Name() != filepath.Base(link) {
+			t.Errorf("Stat(%q).Name() = %q, want %q", link, fi1.Name(), filepath.Base(link))
+			continue
+		}
+		if !os.SameFile(fi, fi1) {
+			t.Errorf("%q should point to %q", link, dir)
+			continue
+		}
+
+		fi2, err := os.Lstat(link)
+		if err != nil {
+			t.Errorf("failed to lstat link %v: %v", link, err)
+			continue
+		}
+		if m := fi2.Mode(); m&os.ModeSymlink == 0 {
+			t.Errorf("%q should be a link, but is not (mode=0x%x)", link, uint32(m))
+			continue
+		}
+		if m := fi2.Mode(); m&os.ModeDir != 0 {
+			t.Errorf("%q should be a link, not a directory (mode=0x%x)", link, uint32(m))
 			continue
 		}
 	}
@@ -263,7 +289,6 @@ func TestDirectoryJunction(t *testing.T) {
 				t.addPrintName("")
 				return createMountPoint(link, &t)
 			},
-			issueNo: 16145,
 		},
 	}
 	output, _ := osexec.Command("cmd", "/c", "mklink", "/?").Output()
@@ -275,7 +300,7 @@ func TestDirectoryJunction(t *testing.T) {
 				mklink: func(link, target string) error {
 					output, err := osexec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
 					if err != nil {
-						fmt.Errorf("failed to run mklink %v %v: %v %q", link, target, err, output)
+						t.Errorf("failed to run mklink %v %v: %v %q", link, target, err, output)
 					}
 					return nil
 				},
@@ -347,7 +372,7 @@ func TestDirectorySymbolicLink(t *testing.T) {
 				mklink: func(link, target string) error {
 					output, err := osexec.Command("cmd", "/c", "mklink", "/D", link, target).CombinedOutput()
 					if err != nil {
-						fmt.Errorf("failed to run mklink %v %v: %v %q", link, target, err, output)
+						t.Errorf("failed to run mklink %v %v: %v %q", link, target, err, output)
 					}
 					return nil
 				},
@@ -396,10 +421,116 @@ func TestDirectorySymbolicLink(t *testing.T) {
 				t.addPrintNameNoNUL(filepath.Base(target))
 				return createSymbolicLink(link, &t, true)
 			},
-			issueNo: 15978,
 		},
 	)
 	testDirLinks(t, tests)
+}
+
+func TestNetworkSymbolicLink(t *testing.T) {
+	testenv.MustHaveSymlink(t)
+
+	const _NERR_ServerNotStarted = syscall.Errno(2114)
+
+	dir, err := ioutil.TempDir("", "TestNetworkSymbolicLink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = os.Chdir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+
+	shareName := "GoSymbolicLinkTestShare" // hope no conflictions
+	sharePath := filepath.Join(dir, shareName)
+	testDir := "TestDir"
+
+	err = os.MkdirAll(filepath.Join(sharePath, testDir), 0777)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wShareName, err := syscall.UTF16PtrFromString(shareName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wSharePath, err := syscall.UTF16PtrFromString(sharePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := windows.SHARE_INFO_2{
+		Netname:     wShareName,
+		Type:        windows.STYPE_DISKTREE,
+		Remark:      nil,
+		Permissions: 0,
+		MaxUses:     1,
+		CurrentUses: 0,
+		Path:        wSharePath,
+		Passwd:      nil,
+	}
+
+	err = windows.NetShareAdd(nil, 2, (*byte)(unsafe.Pointer(&p)), nil)
+	if err != nil {
+		if err == syscall.ERROR_ACCESS_DENIED {
+			t.Skip("you don't have enough privileges to add network share")
+		}
+		if err == _NERR_ServerNotStarted {
+			t.Skip(_NERR_ServerNotStarted.Error())
+		}
+		t.Fatal(err)
+	}
+	defer func() {
+		err := windows.NetShareDel(nil, wShareName, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	UNCPath := `\\localhost\` + shareName + `\`
+
+	fi1, err := os.Stat(sharePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi2, err := os.Stat(UNCPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(fi1, fi2) {
+		t.Fatalf("%q and %q should be the same directory, but not", sharePath, UNCPath)
+	}
+
+	target := filepath.Join(UNCPath, testDir)
+	link := "link"
+
+	err = os.Symlink(target, link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(link)
+
+	got, err := os.Readlink(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != target {
+		t.Errorf(`os.Readlink("%s"): got %v, want %v`, link, got, target)
+	}
+
+	got, err = filepath.EvalSymlinks(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != target {
+		t.Errorf(`filepath.EvalSymlinks("%s"): got %v, want %v`, link, got, target)
+	}
 }
 
 func TestStartProcessAttr(t *testing.T) {
@@ -543,90 +674,222 @@ func TestStatSymlinkLoop(t *testing.T) {
 	defer os.Remove("x")
 
 	_, err = os.Stat("x")
-	if perr, ok := err.(*os.PathError); !ok || perr.Err != syscall.ELOOP {
-		t.Errorf("expected *PathError with ELOOP, got %T: %v\n", err, err)
+	if _, ok := err.(*os.PathError); !ok {
+		t.Errorf("expected *PathError, got %T: %v\n", err, err)
 	}
 }
 
 func TestReadStdin(t *testing.T) {
-	defer os.ResetGetConsoleCPAndReadFileFuncs()
+	old := poll.ReadConsole
+	defer func() {
+		poll.ReadConsole = old
+	}()
 
 	testConsole := os.NewConsoleFile(syscall.Stdin, "test")
 
-	var (
-		hiraganaA_CP932 = []byte{0x82, 0xa0}
-		hiraganaA_UTF8  = "\u3042"
+	var tests = []string{
+		"abc",
+		"äöü",
+		"\u3042",
+		"“hi”™",
+		"hello\x1aworld",
+		"\U0001F648\U0001F649\U0001F64A",
+	}
 
-		tests = []struct {
-			cp     uint32
-			input  []byte
-			output string // always utf8
-		}{
-			{
-				cp:     437,
-				input:  []byte("abc"),
-				output: "abc",
-			},
-			{
-				cp:     850,
-				input:  []byte{0x84, 0x94, 0x81},
-				output: "äöü",
-			},
-			{
-				cp:     932,
-				input:  hiraganaA_CP932,
-				output: hiraganaA_UTF8,
-			},
-			{
-				cp:     932,
-				input:  bytes.Repeat(hiraganaA_CP932, 2),
-				output: strings.Repeat(hiraganaA_UTF8, 2),
-			},
-			{
-				cp:     932,
-				input:  append(bytes.Repeat(hiraganaA_CP932, 3), '.'),
-				output: strings.Repeat(hiraganaA_UTF8, 3) + ".",
-			},
-			{
-				cp:     932,
-				input:  append(append([]byte("hello"), hiraganaA_CP932...), []byte("world")...),
-				output: "hello" + hiraganaA_UTF8 + "world",
-			},
-			{
-				cp:     932,
-				input:  append(append([]byte("hello"), bytes.Repeat(hiraganaA_CP932, 5)...), []byte("world")...),
-				output: "hello" + strings.Repeat(hiraganaA_UTF8, 5) + "world",
-			},
+	for _, consoleSize := range []int{1, 2, 3, 10, 16, 100, 1000} {
+		for _, readSize := range []int{1, 2, 3, 4, 5, 8, 10, 16, 20, 50, 100} {
+			for _, s := range tests {
+				t.Run(fmt.Sprintf("c%d/r%d/%s", consoleSize, readSize, s), func(t *testing.T) {
+					s16 := utf16.Encode([]rune(s))
+					poll.ReadConsole = func(h syscall.Handle, buf *uint16, toread uint32, read *uint32, inputControl *byte) error {
+						if inputControl != nil {
+							t.Fatalf("inputControl not nil")
+						}
+						n := int(toread)
+						if n > consoleSize {
+							n = consoleSize
+						}
+						n = copy((*[10000]uint16)(unsafe.Pointer(buf))[:n], s16)
+						s16 = s16[n:]
+						*read = uint32(n)
+						t.Logf("read %d -> %d", toread, *read)
+						return nil
+					}
+
+					var all []string
+					var buf []byte
+					chunk := make([]byte, readSize)
+					for {
+						n, err := testConsole.Read(chunk)
+						buf = append(buf, chunk[:n]...)
+						if err == io.EOF {
+							all = append(all, string(buf))
+							if len(all) >= 5 {
+								break
+							}
+							buf = buf[:0]
+						} else if err != nil {
+							t.Fatalf("reading %q: error: %v", s, err)
+						}
+						if len(buf) >= 2000 {
+							t.Fatalf("reading %q: stuck in loop: %q", s, buf)
+						}
+					}
+
+					want := strings.Split(s, "\x1a")
+					for len(want) < 5 {
+						want = append(want, "")
+					}
+					if !reflect.DeepEqual(all, want) {
+						t.Errorf("reading %q:\nhave %x\nwant %x", s, all, want)
+					}
+				})
+			}
 		}
-	)
-	for _, bufsize := range []int{1, 2, 3, 4, 5, 8, 10, 16, 20, 50, 100} {
-	nextTest:
-		for ti, test := range tests {
-			input := bytes.NewBuffer(test.input)
-			*os.ReadFileP = func(h syscall.Handle, buf []byte, done *uint32, o *syscall.Overlapped) error {
-				n, err := input.Read(buf)
-				*done = uint32(n)
-				return err
-			}
-			*os.GetCPP = func() uint32 {
-				return test.cp
-			}
-			var bigbuf []byte
-			for len(bigbuf) < len([]byte(test.output)) {
-				buf := make([]byte, bufsize)
-				n, err := testConsole.Read(buf)
-				if err != nil {
-					t.Errorf("test=%d bufsize=%d: read failed: %v", ti, bufsize, err)
-					continue nextTest
-				}
-				bigbuf = append(bigbuf, buf[:n]...)
-			}
-			have := hex.Dump(bigbuf)
-			expected := hex.Dump([]byte(test.output))
-			if have != expected {
-				t.Errorf("test=%d bufsize=%d: %q expected, but %q received", ti, bufsize, expected, have)
-				continue nextTest
-			}
+	}
+}
+
+func TestStatPagefile(t *testing.T) {
+	_, err := os.Stat(`c:\pagefile.sys`)
+	if err == nil {
+		return
+	}
+	if os.IsNotExist(err) {
+		t.Skip(`skipping because c:\pagefile.sys is not found`)
+	}
+	t.Fatal(err)
+}
+
+// syscallCommandLineToArgv calls syscall.CommandLineToArgv
+// and converts returned result into []string.
+func syscallCommandLineToArgv(cmd string) ([]string, error) {
+	var argc int32
+	argv, err := syscall.CommandLineToArgv(&syscall.StringToUTF16(cmd)[0], &argc)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.LocalFree(syscall.Handle(uintptr(unsafe.Pointer(argv))))
+
+	var args []string
+	for _, v := range (*argv)[:argc] {
+		args = append(args, syscall.UTF16ToString((*v)[:]))
+	}
+	return args, nil
+}
+
+// compareCommandLineToArgvWithSyscall ensures that
+// os.CommandLineToArgv(cmd) and syscall.CommandLineToArgv(cmd)
+// return the same result.
+func compareCommandLineToArgvWithSyscall(t *testing.T, cmd string) {
+	syscallArgs, err := syscallCommandLineToArgv(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := os.CommandLineToArgv(cmd)
+	if want, have := fmt.Sprintf("%q", syscallArgs), fmt.Sprintf("%q", args); want != have {
+		t.Errorf("testing os.commandLineToArgv(%q) failed: have %q want %q", cmd, args, syscallArgs)
+		return
+	}
+}
+
+func TestCmdArgs(t *testing.T) {
+	tmpdir, err := ioutil.TempDir("", "TestCmdArgs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpdir)
+
+	const prog = `
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+func main() {
+	fmt.Printf("%q", os.Args)
+}
+`
+	src := filepath.Join(tmpdir, "main.go")
+	err = ioutil.WriteFile(src, []byte(prog), 0666)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmpdir, "main.exe")
+	cmd := osexec.Command(testenv.GoToolPath(t), "build", "-o", exe, src)
+	cmd.Dir = tmpdir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("building main.exe failed: %v\n%s", err, out)
+	}
+
+	var cmds = []string{
+		``,
+		` a b c`,
+		` "`,
+		` ""`,
+		` """`,
+		` "" a`,
+		` "123"`,
+		` \"123\"`,
+		` \"123 456\"`,
+		` \\"`,
+		` \\\"`,
+		` \\\\\"`,
+		` \\\"x`,
+		` """"\""\\\"`,
+		` abc`,
+		` \\\\\""x"""y z`,
+		"\tb\t\"x\ty\"",
+		` "Брад" d e`,
+		// examples from https://msdn.microsoft.com/en-us/library/17w5ykft.aspx
+		` "abc" d e`,
+		` a\\b d"e f"g h`,
+		` a\\\"b c d`,
+		` a\\\\"b c" d e`,
+		// http://daviddeley.com/autohotkey/parameters/parameters.htm#WINARGV
+		// from 5.4  Examples
+		` CallMeIshmael`,
+		` "Call Me Ishmael"`,
+		` Cal"l Me I"shmael`,
+		` CallMe\"Ishmael`,
+		` "CallMe\"Ishmael"`,
+		` "Call Me Ishmael\\"`,
+		` "CallMe\\\"Ishmael"`,
+		` a\\\b`,
+		` "a\\\b"`,
+		// from 5.5  Some Common Tasks
+		` "\"Call Me Ishmael\""`,
+		` "C:\TEST A\\"`,
+		` "\"C:\TEST A\\\""`,
+		// from 5.6  The Microsoft Examples Explained
+		` "a b c"  d  e`,
+		` "ab\"c"  "\\"  d`,
+		` a\\\b d"e f"g h`,
+		` a\\\"b c d`,
+		` a\\\\"b c" d e`,
+		// from 5.7  Double Double Quote Examples (pre 2008)
+		` "a b c""`,
+		` """CallMeIshmael"""  b  c`,
+		` """Call Me Ishmael"""`,
+		` """"Call Me Ishmael"" b c`,
+	}
+	for _, cmd := range cmds {
+		compareCommandLineToArgvWithSyscall(t, "test"+cmd)
+		compareCommandLineToArgvWithSyscall(t, `"cmd line"`+cmd)
+		compareCommandLineToArgvWithSyscall(t, exe+cmd)
+
+		// test both syscall.EscapeArg and os.commandLineToArgv
+		args := os.CommandLineToArgv(exe + cmd)
+		out, err := osexec.Command(args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("running %q failed: %v\n%v", args, err, string(out))
+		}
+		if want, have := fmt.Sprintf("%q", args), string(out); want != have {
+			t.Errorf("wrong output of executing %q: have %q want %q", args, have, want)
+			continue
 		}
 	}
 }

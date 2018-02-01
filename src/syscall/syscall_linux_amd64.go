@@ -5,8 +5,8 @@
 package syscall
 
 const (
-	_SYS_dup      = SYS_DUP2
-	_SYS_getdents = SYS_GETDENTS64
+	_SYS_dup       = SYS_DUP2
+	_SYS_setgroups = SYS_SETGROUPS
 )
 
 //sys	Dup2(oldfd int, newfd int) (err error)
@@ -133,3 +133,5 @@ func (msghdr *Msghdr) SetControllen(length int) {
 func (cmsg *Cmsghdr) SetLen(length int) {
 	cmsg.Len = uint64(length)
 }
+
+func rawVforkSyscall(trap, a1 uintptr) (r1 uintptr, err Errno)

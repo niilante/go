@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// TODO(rsc): Rewrite all nn(SP) references into name+(nn-8)(FP)
-// so that go vet can check that they are correct.
-
 #include "textflag.h"
 #include "funcdata.h"
 
@@ -21,8 +18,8 @@ TEXT	·Syscall(SB),NOSPLIT,$0-64
 	CALL	runtime·entersyscall(SB)
 	MOVQ	trap+0(FP), BP	// syscall entry
 	// slide args down on top of system call number
-	LEAQ	16(SP), SI
-	LEAQ	8(SP), DI
+	LEAQ	a1+8(FP), SI
+	LEAQ	trap+0(FP), DI
 	CLD
 	MOVSQ
 	MOVSQ
@@ -40,7 +37,7 @@ TEXT	·Syscall(SB),NOSPLIT,$0-64
 	JMP	copyresult3
 	
 ok3:
-	LEAQ	runtime·emptystring(SB), SI	
+	LEAQ	·emptystring(SB), SI
 	
 copyresult3:
 	LEAQ	err+48(FP), DI
@@ -56,8 +53,8 @@ TEXT	·Syscall6(SB),NOSPLIT,$0-88
 	CALL	runtime·entersyscall(SB)
 	MOVQ	trap+0(FP), BP	// syscall entry
 	// slide args down on top of system call number
-	LEAQ	16(SP), SI
-	LEAQ	8(SP), DI
+	LEAQ	a1+8(FP), SI
+	LEAQ	trap+0(FP), DI
 	CLD
 	MOVSQ
 	MOVSQ
@@ -78,7 +75,7 @@ TEXT	·Syscall6(SB),NOSPLIT,$0-88
 	JMP	copyresult4
 	
 ok4:
-	LEAQ	runtime·emptystring(SB), SI
+	LEAQ	·emptystring(SB), SI
 	
 copyresult4:
 	LEAQ	err+72(FP), DI
@@ -93,8 +90,8 @@ copyresult4:
 TEXT ·RawSyscall(SB),NOSPLIT,$0-56
 	MOVQ	trap+0(FP), BP	// syscall entry
 	// slide args down on top of system call number
-	LEAQ	16(SP), SI
-	LEAQ	8(SP), DI
+	LEAQ	a1+8(FP), SI
+	LEAQ	trap+0(FP), DI
 	CLD
 	MOVSQ
 	MOVSQ
@@ -108,8 +105,8 @@ TEXT ·RawSyscall(SB),NOSPLIT,$0-56
 TEXT	·RawSyscall6(SB),NOSPLIT,$0-80
 	MOVQ	trap+0(FP), BP	// syscall entry
 	// slide args down on top of system call number
-	LEAQ	16(SP), SI
-	LEAQ	8(SP), DI
+	LEAQ	a1+8(FP), SI
+	LEAQ	trap+0(FP), DI
 	CLD
 	MOVSQ
 	MOVSQ
@@ -144,7 +141,7 @@ TEXT ·seek(SB),NOSPLIT,$0-56
 	JMP	copyresult6
 	
 ok6:
-	LEAQ	runtime·emptystring(SB), SI
+	LEAQ	·emptystring(SB), SI
 	
 copyresult6:
 	LEAQ	err+40(FP), DI
@@ -152,13 +149,4 @@ copyresult6:
 	CLD
 	MOVSQ
 	MOVSQ
-	RET
-
-//func exit(code int)
-// Import runtime·exit for cleanly exiting.
-TEXT ·exit(SB),NOSPLIT,$8-8
-	NO_LOCAL_POINTERS
-	MOVQ	code+0(FP), AX
-	MOVQ	AX, 0(SP)
-	CALL	runtime·exit(SB)
 	RET

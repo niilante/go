@@ -7,6 +7,7 @@ package net
 import (
 	"bytes"
 	"fmt"
+	"internal/poll"
 	"io"
 	"io/ioutil"
 	"reflect"
@@ -99,13 +100,13 @@ func TestBuffers_WriteTo(t *testing.T) {
 }
 
 func testBuffer_writeTo(t *testing.T, chunks int, useCopy bool) {
-	oldHook := testHookDidWritev
-	defer func() { testHookDidWritev = oldHook }()
+	oldHook := poll.TestHookDidWritev
+	defer func() { poll.TestHookDidWritev = oldHook }()
 	var writeLog struct {
 		sync.Mutex
 		log []int
 	}
-	testHookDidWritev = func(size int) {
+	poll.TestHookDidWritev = func(size int) {
 		writeLog.Lock()
 		writeLog.log = append(writeLog.log, size)
 		writeLog.Unlock()
@@ -150,22 +151,76 @@ func testBuffer_writeTo(t *testing.T, chunks int, useCopy bool) {
 		}
 
 		var wantSum int
-		var wantMinCalls int
 		switch runtime.GOOS {
-		case "darwin", "dragonfly", "freebsd", "linux", "netbsd", "openbsd":
+		case "android", "darwin", "dragonfly", "freebsd", "linux", "netbsd", "openbsd":
+			var wantMinCalls int
 			wantSum = want.Len()
 			v := chunks
 			for v > 0 {
 				wantMinCalls++
 				v -= 1024
 			}
-		}
-		if len(writeLog.log) < wantMinCalls {
-			t.Errorf("write calls = %v < wanted min %v", len(writeLog.log), wantMinCalls)
+			if len(writeLog.log) < wantMinCalls {
+				t.Errorf("write calls = %v < wanted min %v", len(writeLog.log), wantMinCalls)
+			}
+		case "windows":
+			var wantCalls int
+			wantSum = want.Len()
+			if wantSum > 0 {
+				wantCalls = 1 // windows will always do 1 syscall, unless sending empty buffer
+			}
+			if len(writeLog.log) != wantCalls {
+				t.Errorf("write calls = %v; want %v", len(writeLog.log), wantCalls)
+			}
 		}
 		if gotSum != wantSum {
 			t.Errorf("writev call sum  = %v; want %v", gotSum, wantSum)
 		}
 		return nil
 	})
+}
+
+func TestWritevError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skipf("skipping the test: windows does not have problem sending large chunks of data")
+	}
+
+	ln, err := newLocalListener("tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ch := make(chan Conn, 1)
+	go func() {
+		defer close(ch)
+		c, err := ln.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		ch <- c
+	}()
+	c1, err := Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2 := <-ch
+	if c2 == nil {
+		t.Fatal("no server side connection")
+	}
+	c2.Close()
+
+	// 1 GB of data should be enough to notice the connection is gone.
+	// Just a few bytes is not enough.
+	// Arrange to reuse the same 1 MB buffer so that we don't allocate much.
+	buf := make([]byte, 1<<20)
+	buffers := make(Buffers, 1<<10)
+	for i := range buffers {
+		buffers[i] = buf
+	}
+	if _, err := buffers.WriteTo(c1); err == nil {
+		t.Fatal("Buffers.WriteTo(closed conn) succeeded, want error")
+	}
 }

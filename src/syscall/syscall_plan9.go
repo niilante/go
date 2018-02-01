@@ -31,6 +31,8 @@ func (e ErrorString) Timeout() bool {
 	return e == EBUSY || e == ETIMEDOUT
 }
 
+var emptystring string
+
 // A Note is a string describing a process note.
 // It implements the os.Signal interface.
 type Note string
@@ -82,11 +84,6 @@ func errstr() string {
 	buf[len(buf)-1] = 0
 	return cstring(buf[:])
 }
-
-// Implemented in assembly to import from runtime.
-func exit(code int)
-
-func Exit(code int) { exit(code) }
 
 func readnum(path string) (uint, error) {
 	var b [12]byte
@@ -251,9 +248,7 @@ func Unmount(name, old string) (err error) {
 			return err
 		}
 		r0, _, e = Syscall(SYS_UNMOUNT, uintptr(unsafe.Pointer(namep)), oldptr, 0)
-		use(unsafe.Pointer(namep))
 	}
-	use(unsafe.Pointer(oldp))
 
 	if int32(r0) == -1 {
 		err = e

@@ -168,7 +168,7 @@ func (c *Cookie) String() string {
 			log.Printf("net/http: invalid Cookie.Domain %q; dropping domain attribute", c.Domain)
 		}
 	}
-	if c.Expires.Unix() > 0 {
+	if validCookieExpires(c.Expires) {
 		b.WriteString("; Expires=")
 		b2 := b.Bytes()
 		b.Reset()
@@ -208,7 +208,6 @@ func readCookies(h Header, filter string) []*Cookie {
 			continue
 		}
 		// Per-line attributes
-		parsedPairs := 0
 		for i := 0; i < len(parts); i++ {
 			parts[i] = strings.TrimSpace(parts[i])
 			if len(parts[i]) == 0 {
@@ -229,7 +228,6 @@ func readCookies(h Header, filter string) []*Cookie {
 				continue
 			}
 			cookies = append(cookies, &Cookie{Name: name, Value: val})
-			parsedPairs++
 		}
 	}
 	return cookies
@@ -244,6 +242,12 @@ func validCookieDomain(v string) bool {
 		return true
 	}
 	return false
+}
+
+// validCookieExpires returns whether v is a valid cookie expires-value.
+func validCookieExpires(t time.Time) bool {
+	// IETF RFC 6265 Section 5.1.1.5, the year must not be less than 1601
+	return t.Year() >= 1601
 }
 
 // isCookieDomainName returns whether s is a valid domain name or a valid
@@ -322,7 +326,7 @@ func sanitizeCookieValue(v string) string {
 	if len(v) == 0 {
 		return v
 	}
-	if v[0] == ' ' || v[0] == ',' || v[len(v)-1] == ' ' || v[len(v)-1] == ',' {
+	if strings.IndexByte(v, ' ') >= 0 || strings.IndexByte(v, ',') >= 0 {
 		return `"` + v + `"`
 	}
 	return v

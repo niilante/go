@@ -12,10 +12,18 @@ import (
 	"unsafe"
 )
 
+// finblock is an array of finalizers to be executed. finblocks are
+// arranged in a linked list for the finalizer queue.
+//
+// finblock is allocated from non-GC'd memory, so any heap pointers
+// must be specially handled. GC currently assumes that the finalizer
+// queue does not grow during marking (but it can shrink).
+//
+//go:notinheap
 type finblock struct {
 	alllink *finblock
 	next    *finblock
-	cnt     int32
+	cnt     uint32
 	_       int32
 	fin     [(_FinBlockSize - 2*sys.PtrSize - 2*4) / unsafe.Sizeof(finalizer{})]finalizer
 }
@@ -31,11 +39,11 @@ var allfin *finblock // list of all blocks
 
 // NOTE: Layout known to queuefinalizer.
 type finalizer struct {
-	fn   *funcval       // function to call
-	arg  unsafe.Pointer // ptr to object
+	fn   *funcval       // function to call (may be a heap pointer)
+	arg  unsafe.Pointer // ptr to object (may be a heap pointer)
 	nret uintptr        // bytes of return values from fn
 	fint *_type         // type of first argument of fn
-	ot   *ptrtype       // type of ptr to object
+	ot   *ptrtype       // type of ptr to object (may be a heap pointer)
 }
 
 var finalizer1 = [...]byte{
@@ -67,10 +75,19 @@ var finalizer1 = [...]byte{
 }
 
 func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot *ptrtype) {
+	if gcphase != _GCoff {
+		// Currently we assume that the finalizer queue won't
+		// grow during marking so we don't have to rescan it
+		// during mark termination. If we ever need to lift
+		// this assumption, we can do it by adding the
+		// necessary barriers to queuefinalizer (which it may
+		// have automatically).
+		throw("queuefinalizer during GC")
+	}
+
 	lock(&finlock)
-	if finq == nil || finq.cnt == int32(len(finq.fin)) {
+	if finq == nil || finq.cnt == uint32(len(finq.fin)) {
 		if finc == nil {
-			// Note: write barrier here, assigning to finc, but should be okay.
 			finc = (*finblock)(persistentalloc(_FinBlockSize, 0, &memstats.gc_sys))
 			finc.alllink = allfin
 			allfin = finc
@@ -96,7 +113,7 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 		finq = block
 	}
 	f := &finq.fin[finq.cnt]
-	finq.cnt++
+	atomic.Xadd(&finq.cnt, +1) // Sync with markroots
 	f.fn = fn
 	f.nret = nret
 	f.fint = fint
@@ -109,7 +126,7 @@ func queuefinalizer(p unsafe.Pointer, fn *funcval, nret uintptr, fint *_type, ot
 //go:nowritebarrier
 func iterate_finq(callback func(*funcval, unsafe.Pointer, uintptr, *_type, *ptrtype)) {
 	for fb := allfin; fb != nil; fb = fb.alllink {
-		for i := int32(0); i < fb.cnt; i++ {
+		for i := uint32(0); i < fb.cnt; i++ {
 			f := &fb.fin[i]
 			callback(f.fn, f.arg, f.nret, f.fint, f.ot)
 		}
@@ -179,6 +196,11 @@ func runfinq() {
 				if f.fint == nil {
 					throw("missing type in runfinq")
 				}
+				// frame is effectively uninitialized
+				// memory. That means we have to clear
+				// it before writing to it to avoid
+				// confusing the write barrier.
+				*(*[2]uintptr)(frame) = [2]uintptr{}
 				switch f.fint.kind & kindMask {
 				case kindPtr:
 					// direct use of pointer
@@ -191,7 +213,7 @@ func runfinq() {
 					if len(ityp.mhdr) != 0 {
 						// convert to interface with methods
 						// this conversion is guaranteed to succeed - we checked in SetFinalizer
-						assertE2I(ityp, *(*eface)(frame), (*iface)(frame))
+						*(*iface)(frame) = assertE2I(ityp, *(*eface)(frame))
 					}
 				default:
 					throw("bad kind in runfinq")
@@ -200,11 +222,14 @@ func runfinq() {
 				reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz))
 				fingRunning = false
 
-				// drop finalizer queue references to finalized object
+				// Drop finalizer queue heap references
+				// before hiding them from markroot.
+				// This also ensures these will be
+				// clear if we reuse the finalizer.
 				f.fn = nil
 				f.arg = nil
 				f.ot = nil
-				fb.cnt = i - 1
+				atomic.Store(&fb.cnt, i-1)
 			}
 			next := fb.next
 			lock(&finlock)
@@ -373,7 +398,7 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 			// ok - satisfies empty interface
 			goto okarg
 		}
-		if assertE2I2(ityp, *efaceOf(&obj), nil) {
+		if _, ok := assertE2I2(ityp, *efaceOf(&obj)); ok {
 			goto okarg
 		}
 	}
@@ -417,7 +442,7 @@ func findObject(v unsafe.Pointer) (s *mspan, x unsafe.Pointer, n uintptr) {
 	}
 	p := uintptr(v) >> pageShift
 	q := p - arena_start>>pageShift
-	s = *(**mspan)(add(unsafe.Pointer(mheap_.spans), q*sys.PtrSize))
+	s = mheap_.spans[q]
 	if s == nil {
 		return
 	}
@@ -430,17 +455,13 @@ func findObject(v unsafe.Pointer) (s *mspan, x unsafe.Pointer, n uintptr) {
 	}
 
 	n = s.elemsize
-	if s.sizeclass != 0 {
+	if s.spanclass.sizeclass() != 0 {
 		x = add(x, (uintptr(v)-uintptr(x))/n*n)
 	}
 	return
 }
 
-// Mark KeepAlive as noinline so that the current compiler will ensure
-// that the argument is alive at the point of the function call.
-// If it were inlined, it would disappear, and there would be nothing
-// keeping the argument alive. Perhaps a future compiler will recognize
-// runtime.KeepAlive specially and do something more efficient.
+// Mark KeepAlive as noinline so that it is easily detectable as an intrinsic.
 //go:noinline
 
 // KeepAlive marks its argument as currently reachable.
@@ -462,4 +483,11 @@ func findObject(v unsafe.Pointer) (s *mspan, x unsafe.Pointer, n uintptr) {
 // Without the KeepAlive call, the finalizer could run at the start of
 // syscall.Read, closing the file descriptor before syscall.Read makes
 // the actual system call.
-func KeepAlive(interface{}) {}
+func KeepAlive(x interface{}) {
+	// Introduce a use of x that the compiler can't eliminate.
+	// This makes sure x is alive on entry. We need x to be alive
+	// on entry for "defer runtime.KeepAlive(x)"; see issue 21402.
+	if cgoAlwaysFalse {
+		println(x)
+	}
+}

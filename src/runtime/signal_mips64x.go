@@ -77,7 +77,7 @@ func (c *sigctxt) preparePanic(sig uint32, gp *g) {
 	// but we do recognize the link register as code,
 	// then assume this was a call to non-code and treat like
 	// pc == 0, to make unwinding show the context.
-	if pc != 0 && findfunc(pc) == nil && findfunc(uintptr(c.link())) != nil {
+	if pc != 0 && !findfunc(pc).valid() && findfunc(uintptr(c.link())).valid() {
 		pc = 0
 	}
 
@@ -89,6 +89,8 @@ func (c *sigctxt) preparePanic(sig uint32, gp *g) {
 	}
 
 	// In case we are panicking from external C code
+	sigpanicPC := uint64(funcPC(sigpanic))
+	c.set_r28(sigpanicPC >> 32 << 32) // RSB register
 	c.set_r30(uint64(uintptr(unsafe.Pointer(gp))))
-	c.set_pc(uint64(funcPC(sigpanic)))
+	c.set_pc(sigpanicPC)
 }

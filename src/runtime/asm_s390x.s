@@ -7,43 +7,82 @@
 #include "funcdata.h"
 #include "textflag.h"
 
-// Indicate the status of vector facility
-// -1: 	init value
-// 0:	vector not installed
-// 1:	vector installed and enabled
-// 2:	vector installed but not enabled
+// _rt0_s390x_lib is common startup code for s390x systems when
+// using -buildmode=c-archive or -buildmode=c-shared. The linker will
+// arrange to invoke this function as a global constructor (for
+// c-archive) or when the shared library is loaded (for c-shared).
+// We expect argc and argv to be passed in the usual C ABI registers
+// R2 and R3.
+TEXT _rt0_s390x_lib(SB), NOSPLIT|NOFRAME, $0
+	STMG	R6, R15, 48(R15)
+	MOVD	R2, _rt0_s390x_lib_argc<>(SB)
+	MOVD	R3, _rt0_s390x_lib_argv<>(SB)
 
-DATA runtime·vectorfacility+0x00(SB)/4, $-1
-GLOBL runtime·vectorfacility(SB), NOPTR, $4
+	// Save R6-R15 in the register save area of the calling function.
+	STMG	R6, R15, 48(R15)
 
-TEXT runtime·checkvectorfacility(SB),NOSPLIT,$32-0
-	MOVD    $2, R0
-	MOVD	R1, tmp-32(SP)
-	MOVD    $x-24(SP), R1
-	XC	$24, 0(R1), 0(R1)
-//      STFLE   0(R1)
-	WORD    $0xB2B01000
-	MOVBZ   z-8(SP), R1
-	AND     $0x40, R1
-	BNE     vectorinstalled
-	MOVB    $0, runtime·vectorfacility(SB) //Vector not installed
-	MOVD	tmp-32(SP), R1
-	MOVD    $0, R0
+	// Allocate 80 bytes on the stack.
+	MOVD	$-80(R15), R15
+
+	// Save F8-F15 in our stack frame.
+	FMOVD	F8, 16(R15)
+	FMOVD	F9, 24(R15)
+	FMOVD	F10, 32(R15)
+	FMOVD	F11, 40(R15)
+	FMOVD	F12, 48(R15)
+	FMOVD	F13, 56(R15)
+	FMOVD	F14, 64(R15)
+	FMOVD	F15, 72(R15)
+
+	// Synchronous initialization.
+	MOVD	$runtime·libpreinit(SB), R1
+	BL	R1
+
+	// Create a new thread to finish Go runtime initialization.
+	MOVD	_cgo_sys_thread_create(SB), R1
+	CMP	R1, $0
+	BEQ	nocgo
+	MOVD	$_rt0_s390x_lib_go(SB), R2
+	MOVD	$0, R3
+	BL	R1
+	BR	restore
+
+nocgo:
+	MOVD	$0x800000, R1              // stacksize
+	MOVD	R1, 0(R15)
+	MOVD	$_rt0_s390x_lib_go(SB), R1
+	MOVD	R1, 8(R15)                 // fn
+	MOVD	$runtime·newosproc(SB), R1
+	BL	R1
+
+restore:
+	// Restore F8-F15 from our stack frame.
+	FMOVD	16(R15), F8
+	FMOVD	24(R15), F9
+	FMOVD	32(R15), F10
+	FMOVD	40(R15), F11
+	FMOVD	48(R15), F12
+	FMOVD	56(R15), F13
+	FMOVD	64(R15), F14
+	FMOVD	72(R15), F15
+	MOVD	$80(R15), R15
+
+	// Restore R6-R15.
+	LMG	48(R15), R6, R15
 	RET
-vectorinstalled:
-	// check if the vector instruction has been enabled
-	VLEIB   $0, $0xF, V16
-	VLGVB   $0, V16, R0
-	CMPBEQ  R0, $0xF, vectorenabled
-	MOVB    $2, runtime·vectorfacility(SB) //Vector installed but not enabled
-	MOVD    tmp-32(SP), R1
-	MOVD    $0, R0
-	RET
-vectorenabled:
-	MOVB    $1, runtime·vectorfacility(SB) //Vector installed and enabled
-	MOVD    tmp-32(SP), R1
-	MOVD    $0, R0
-	RET
+
+// _rt0_s390x_lib_go initializes the Go runtime.
+// This is started in a separate thread by _rt0_s390x_lib.
+TEXT _rt0_s390x_lib_go(SB), NOSPLIT|NOFRAME, $0
+	MOVD	_rt0_s390x_lib_argc<>(SB), R2
+	MOVD	_rt0_s390x_lib_argv<>(SB), R3
+	MOVD	$runtime·rt0_go(SB), R1
+	BR	R1
+
+DATA _rt0_s390x_lib_argc<>(SB)/8, $0
+GLOBL _rt0_s390x_lib_argc<>(SB), NOPTR, $8
+DATA _rt0_s90x_lib_argv<>(SB)/8, $0
+GLOBL _rt0_s390x_lib_argv<>(SB), NOPTR, $8
 
 TEXT runtime·rt0_go(SB),NOSPLIT,$0
 	// R2 = argc; R3 = argv; R11 = temp; R13 = g; R15 = stack pointer
@@ -144,12 +183,15 @@ TEXT runtime·gosave(SB), NOSPLIT, $-8-8
 	MOVD	g, gobuf_g(R3)
 	MOVD	$0, gobuf_lr(R3)
 	MOVD	$0, gobuf_ret(R3)
-	MOVD	$0, gobuf_ctxt(R3)
+	// Assert ctxt is zero. See func save.
+	MOVD	gobuf_ctxt(R3), R3
+	CMPBEQ	R3, $0, 2(PC)
+	BL	runtime·badctxt(SB)
 	RET
 
 // void gogo(Gobuf*)
 // restore state from Gobuf; longjmp
-TEXT runtime·gogo(SB), NOSPLIT, $-8-8
+TEXT runtime·gogo(SB), NOSPLIT, $16-8
 	MOVD	buf+0(FP), R5
 	MOVD	gobuf_g(R5), g	// make sure g is not nil
 	BL	runtime·save_g(SB)
@@ -259,9 +301,12 @@ switch:
 
 noswitch:
 	// already on m stack, just call directly
+	// Using a tail call here cleans up tracebacks since we won't stop
+	// at an intermediate systemstack.
 	MOVD	0(R12), R3	// code pointer
-	BL	(R3)
-	RET
+	MOVD	0(R15), LR	// restore LR
+	ADD	$8, R15
+	BR	(R3)
 
 /*
  * support for morestack
@@ -279,22 +324,24 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	// Cannot grow scheduler stack (m->g0).
 	MOVD	g_m(g), R7
 	MOVD	m_g0(R7), R8
-	CMPBNE	g, R8, 2(PC)
+	CMPBNE	g, R8, 3(PC)
+	BL	runtime·badmorestackg0(SB)
 	BL	runtime·abort(SB)
 
 	// Cannot grow signal stack (m->gsignal).
 	MOVD	m_gsignal(R7), R8
 	CMP	g, R8
-	BNE	2(PC)
+	BNE	3(PC)
+	BL	runtime·badmorestackgsignal(SB)
 	BL	runtime·abort(SB)
 
 	// Called from f.
 	// Set g->sched to context in f.
-	MOVD	R12, (g_sched+gobuf_ctxt)(g)
 	MOVD	R15, (g_sched+gobuf_sp)(g)
 	MOVD	LR, R8
 	MOVD	R8, (g_sched+gobuf_pc)(g)
 	MOVD	R5, (g_sched+gobuf_lr)(g)
+	MOVD	R12, (g_sched+gobuf_ctxt)(g)
 
 	// Called from f.
 	// Set m->morebuf to f's caller.
@@ -306,6 +353,9 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	m_g0(R7), g
 	BL	runtime·save_g(SB)
 	MOVD	(g_sched+gobuf_sp)(g), R15
+	// Create a stack frame on g0 to call newstack.
+	MOVD	$0, -8(R15)	// Zero saved LR in frame
+	SUB	$8, R15
 	BL	runtime·newstack(SB)
 
 	// Not reached, but make sure the return PC from the call to newstack
@@ -315,23 +365,6 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 TEXT runtime·morestack_noctxt(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	$0, R12
 	BR	runtime·morestack(SB)
-
-TEXT runtime·stackBarrier(SB),NOSPLIT,$0
-	// We came here via a RET to an overwritten LR.
-	// R3 may be live. Other registers are available.
-
-	// Get the original return PC, g.stkbar[g.stkbarPos].savedLRVal.
-	MOVD	(g_stkbar+slice_array)(g), R4
-	MOVD	g_stkbarPos(g), R5
-	MOVD	$stkbar__size, R6
-	MULLD	R5, R6
-	ADD	R4, R6
-	MOVD	stkbar_savedLRVal(R6), R6
-	// Record that this stack barrier was hit.
-	ADD	$1, R5
-	MOVD	R5, g_stkbarPos(g)
-	// Jump to the original return PC.
-	BR	(R6)
 
 // reflectcall: call a function with the given argument list
 // func call(argtype *_type, f *FuncVal, arg *byte, argsize, retoffset uint32).
@@ -352,8 +385,6 @@ TEXT reflect·call(SB), NOSPLIT, $0-0
 
 TEXT ·reflectcall(SB), NOSPLIT, $-8-32
 	MOVWZ argsize+24(FP), R3
-	// NOTE(rsc): No call16, because CALLFN needs four words
-	// of argument space to invoke callwritebarrier.
 	DISPATCH(runtime·call32, 32)
 	DISPATCH(runtime·call64, 64)
 	DISPATCH(runtime·call128, 128)
@@ -409,6 +440,7 @@ callFunction:					\
 	PCDATA  $PCDATA_StackMapIndex, $0;	\
 	BL	(R8);				\
 	/* copy return values back */		\
+	MOVD	argtype+0(FP), R7;		\
 	MOVD	arg+16(FP), R6;			\
 	MOVWZ	n+24(FP), R5;			\
 	MOVD	$stack-MAXSIZE(SP), R4;		\
@@ -416,27 +448,19 @@ callFunction:					\
 	ADD	R1, R4;				\
 	ADD	R1, R6;				\
 	SUB	R1, R5;				\
-loopRets: /* copy 256 bytes at a time */	\
-	CMP	R5, $256;			\
-	BLT	tailRets;			\
-	SUB	$256, R5;			\
-	MVC	$256, 0(R4), 0(R6);		\
-	MOVD	$256(R4), R4;			\
-	MOVD	$256(R6), R6;			\
-	BR	loopRets;			\
-tailRets: /* copy remaining bytes */		\
-	CMP	R5, $0;				\
-	BEQ	writeBarrierUpdates;		\
-	SUB	$1, R5;				\
-	EXRL	$callfnMVC<>(SB), R5;		\
-writeBarrierUpdates:				\
-	/* execute write barrier updates */	\
-	MOVD	argtype+0(FP), R1;		\
-	MOVD	arg+16(FP), R2;			\
-	MOVWZ	n+24(FP), R3;			\
-	MOVWZ	retoffset+28(FP), R4;		\
-	STMG	R1, R4, stack-MAXSIZE(SP);	\
-	BL	runtime·callwritebarrier(SB);	\
+	BL	callRet<>(SB);			\
+	RET
+
+// callRet copies return values back at the end of call*. This is a
+// separate function so it can allocate stack space for the arguments
+// to reflectcallmove. It does not follow the Go ABI; it expects its
+// arguments in registers.
+TEXT callRet<>(SB), NOSPLIT, $32-0
+	MOVD	R7, 8(R15)
+	MOVD	R6, 16(R15)
+	MOVD	R4, 24(R15)
+	MOVD	R5, 32(R15)
+	BL	runtime·reflectcallmove(SB)
 	RET
 
 CALLFN(·call32, 32)
@@ -488,13 +512,16 @@ TEXT runtime·jmpdefer(SB),NOSPLIT|NOFRAME,$0-16
 	MOVD	0(R12), R3
 	BR	(R3)
 
-// Save state of caller into g->sched. Smashes R31.
+// Save state of caller into g->sched. Smashes R1.
 TEXT gosave<>(SB),NOSPLIT|NOFRAME,$0
 	MOVD	LR, (g_sched+gobuf_pc)(g)
 	MOVD	R15, (g_sched+gobuf_sp)(g)
 	MOVD	$0, (g_sched+gobuf_lr)(g)
 	MOVD	$0, (g_sched+gobuf_ret)(g)
-	MOVD	$0, (g_sched+gobuf_ctxt)(g)
+	// Assert ctxt is zero. See func save.
+	MOVD	(g_sched+gobuf_ctxt)(g), R1
+	CMPBEQ	R1, $0, 2(PC)
+	BL	runtime·badctxt(SB)
 	RET
 
 // func asmcgocall(fn, arg unsafe.Pointer) int32
@@ -697,28 +724,9 @@ TEXT setg_gcc<>(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	R1, LR
 	RET
 
-TEXT runtime·getcallerpc(SB),NOSPLIT,$8-16
-	MOVD	16(R15), R3		// LR saved by caller
-	MOVD	runtime·stackBarrierPC(SB), R4
-	CMPBNE	R3, R4, nobar
-	// Get original return PC.
-	BL	runtime·nextBarrierPC(SB)
-	MOVD	8(R15), R3
-nobar:
-	MOVD	R3, ret+8(FP)
-	RET
-
-TEXT runtime·setcallerpc(SB),NOSPLIT,$8-16
-	MOVD	pc+8(FP), R3
-	MOVD	16(R15), R4
-	MOVD	runtime·stackBarrierPC(SB), R5
-	CMPBEQ	R4, R5, setbar
-	MOVD	R3, 16(R15)		// set LR in caller
-	RET
-setbar:
-	// Set the stack barrier return PC.
-	MOVD	R3, 8(R15)
-	BL	runtime·setNextBarrierPC(SB)
+TEXT runtime·getcallerpc(SB),NOSPLIT|NOFRAME,$0-8
+	MOVD	0(R15), R3		// LR saved by caller
+	MOVD	R3, ret+0(FP)
 	RET
 
 TEXT runtime·abort(SB),NOSPLIT|NOFRAME,$0-0
@@ -738,23 +746,6 @@ TEXT runtime·cputicks(SB),NOSPLIT,$0-8
 	MOVD	R3, ret+0(FP)
 	RET
 
-// memhash_varlen(p unsafe.Pointer, h seed) uintptr
-// redirects to memhash(p, h, size) using the size
-// stored in the closure.
-TEXT runtime·memhash_varlen(SB),NOSPLIT,$40-24
-	GO_ARGS
-	NO_LOCAL_POINTERS
-	MOVD	p+0(FP), R3
-	MOVD	h+8(FP), R4
-	MOVD	8(R12), R5
-	MOVD	R3, 8(R15)
-	MOVD	R4, 16(R15)
-	MOVD	R5, 24(R15)
-	BL	runtime·memhash(SB)
-	MOVD	32(R15), R3
-	MOVD	R3, ret+16(FP)
-	RET
-
 // AES hashing not implemented for s390x
 TEXT runtime·aeshash(SB),NOSPLIT|NOFRAME,$0-0
 	MOVW	(R0), R15
@@ -765,10 +756,10 @@ TEXT runtime·aeshash64(SB),NOSPLIT|NOFRAME,$0-0
 TEXT runtime·aeshashstr(SB),NOSPLIT|NOFRAME,$0-0
 	MOVW	(R0), R15
 
-// memequal(p, q unsafe.Pointer, size uintptr) bool
+// memequal(a, b unsafe.Pointer, size uintptr) bool
 TEXT runtime·memequal(SB),NOSPLIT|NOFRAME,$0-25
-	MOVD	p+0(FP), R3
-	MOVD	q+8(FP), R5
+	MOVD	a+0(FP), R3
+	MOVD	b+8(FP), R5
 	MOVD	size+16(FP), R6
 	LA	ret+24(FP), R7
 	BR	runtime·memeqbody(SB)
@@ -779,18 +770,6 @@ TEXT runtime·memequal_varlen(SB),NOSPLIT|NOFRAME,$0-17
 	MOVD	b+8(FP), R5
 	MOVD	8(R12), R6    // compiler stores size at offset 8 in the closure
 	LA	ret+16(FP), R7
-	BR	runtime·memeqbody(SB)
-
-// eqstring tests whether two strings are equal.
-// The compiler guarantees that strings passed
-// to eqstring have equal length.
-// See runtime_test.go:eqstring_generic for
-// equivalent Go code.
-TEXT runtime·eqstring(SB),NOSPLIT|NOFRAME,$0-33
-	MOVD	s1str+0(FP), R3
-	MOVD	s1len+8(FP), R6
-	MOVD	s2str+16(FP), R5
-	LA	ret+32(FP), R7
 	BR	runtime·memeqbody(SB)
 
 TEXT bytes·Equal(SB),NOSPLIT|NOFRAME,$0-49
@@ -875,25 +854,14 @@ TEXT runtime·memeqbodyclc(SB),NOSPLIT|NOFRAME,$0-0
 	CLC	$1, 0(R3), 0(R5)
 	RET
 
-TEXT runtime·fastrand(SB), NOSPLIT, $0-4
-	MOVD	g_m(g), R4
-	MOVWZ	m_fastrand(R4), R3
-	ADD	R3, R3
-	CMPW	R3, $0
-	BGE	2(PC)
-	XOR	$0x88888eef, R3
-	MOVW	R3, m_fastrand(R4)
-	MOVW	R3, ret+0(FP)
-	RET
-
-TEXT bytes·IndexByte(SB),NOSPLIT,$0-40
+TEXT bytes·IndexByte(SB),NOSPLIT|NOFRAME,$0-40
 	MOVD	s+0(FP), R3     // s => R3
 	MOVD	s_len+8(FP), R4 // s_len => R4
 	MOVBZ	c+24(FP), R5    // c => R5
 	MOVD	$ret+32(FP), R2 // &ret => R9
 	BR	runtime·indexbytebody(SB)
 
-TEXT strings·IndexByte(SB),NOSPLIT,$0-32
+TEXT strings·IndexByte(SB),NOSPLIT|NOFRAME,$0-32
 	MOVD	s+0(FP), R3     // s => R3
 	MOVD	s_len+8(FP), R4 // s_len => R4
 	MOVBZ	c+16(FP), R5    // c => R5
@@ -905,7 +873,7 @@ TEXT strings·IndexByte(SB),NOSPLIT,$0-32
 // R4: s_len
 // R5: c -- byte sought
 // R2: &ret -- address to put index into
-TEXT runtime·indexbytebody(SB),NOSPLIT,$0
+TEXT runtime·indexbytebody(SB),NOSPLIT|NOFRAME,$0
 	CMPBEQ	R4, $0, notfound
 	MOVD	R3, R6          // store base for later
 	ADD	R3, R4, R8      // the address after the end of the string
@@ -929,12 +897,10 @@ notfound:
 	RET
 
 large:
-	MOVB	runtime·vectorfacility(SB), R1
-	CMPBEQ	R1, $-1, checkvector	// vectorfacility = -1, vector not checked yet
-vectorchecked:
-	CMPBEQ	R1, $1, vectorimpl      // vectorfacility = 1, vector supported
+	MOVBZ	·cpu+facilities_hasVX(SB), R1
+	CMPBNE	R1, $0, vectorimpl
 
-srstimpl:                       // vectorfacility != 1, not support or enable vector
+srstimpl:                       // no vector facility
 	MOVBZ	R5, R0          // c needs to be in R0, leave until last minute as currently R0 is expected to be 0
 srstloop:
 	WORD	$0xB25E0083     // srst %r8, %r3 (search the range [R3, R8))
@@ -952,12 +918,14 @@ notfoundr0:
 
 vectorimpl:
 	//if the address is not 16byte aligned, use loop for the header
-	AND	$15, R3, R8
+	MOVD	R3, R8
+	AND	$15, R8
 	CMPBGT	R8, $0, notaligned
 
 aligned:
 	ADD	R6, R4, R8
-	AND	$-16, R8, R7
+	MOVD	R8, R7
+	AND	$-16, R7
 	// replicate c across V17
 	VLVGB	$0, R5, V19
 	VREPB	$0, V19, V17
@@ -978,7 +946,8 @@ vectorloop:
 	RET
 
 notaligned:
-	AND	$-16, R3, R8
+	MOVD	R3, R8
+	AND	$-16, R8
 	ADD     $16, R8
 notalignedloop:
 	CMPBEQ	R3, R8, aligned
@@ -986,11 +955,6 @@ notalignedloop:
 	LA	1(R3), R3
 	CMPBNE	R7, R5, notalignedloop
 	BR	found
-
-checkvector:
-	CALL	runtime·checkvectorfacility(SB)
-	MOVB    runtime·vectorfacility(SB), R1
-	BR	vectorchecked
 
 TEXT runtime·return0(SB), NOSPLIT, $0
 	MOVW	$0, R3
@@ -1024,23 +988,12 @@ TEXT runtime·goexit(SB),NOSPLIT|NOFRAME,$0-0
 	// traceback from goexit1 must hit code range of goexit
 	BYTE $0x07; BYTE $0x00; // 2-byte nop
 
-TEXT runtime·prefetcht0(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetcht1(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetcht2(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetchnta(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·sigreturn(SB),NOSPLIT,$0-8
+TEXT runtime·sigreturn(SB),NOSPLIT,$0-0
 	RET
 
 TEXT ·publicationBarrier(SB),NOSPLIT|NOFRAME,$0-0
-	SYNC
+        // Stores are already ordered on s390x, so this is just a
+        // compile barrier.
 	RET
 
 TEXT runtime·cmpstring(SB),NOSPLIT|NOFRAME,$0-40
@@ -1104,18 +1057,238 @@ TEXT runtime·cmpbodyclc(SB),NOSPLIT|NOFRAME,$0-0
 	CLC	$1, 0(R3), 0(R5)
 	RET
 
+// func supportsVX() bool
+TEXT strings·supportsVX(SB),NOSPLIT,$0-1
+	MOVBZ	runtime·cpu+facilities_hasVX(SB), R0
+	MOVB	R0, ret+0(FP)
+	RET
+
+// func supportsVX() bool
+TEXT bytes·supportsVX(SB),NOSPLIT,$0-1
+	MOVBZ	runtime·cpu+facilities_hasVX(SB), R0
+	MOVB	R0, ret+0(FP)
+	RET
+
+// func indexShortStr(s, sep string) int
+// Caller must confirm availability of vx facility before calling.
+TEXT strings·indexShortStr(SB),NOSPLIT|NOFRAME,$0-40
+	LMG	s+0(FP), R1, R2   // R1=&s[0],   R2=len(s)
+	LMG	sep+16(FP), R3, R4 // R3=&sep[0], R4=len(sep)
+	MOVD	$ret+32(FP), R5
+	BR	runtime·indexShortStr(SB)
+
+// func indexShortStr(s, sep []byte) int
+// Caller must confirm availability of vx facility before calling.
+TEXT bytes·indexShortStr(SB),NOSPLIT|NOFRAME,$0-56
+	LMG	s+0(FP), R1, R2    // R1=&s[0],   R2=len(s)
+	LMG	sep+24(FP), R3, R4 // R3=&sep[0], R4=len(sep)
+	MOVD	$ret+48(FP), R5
+	BR	runtime·indexShortStr(SB)
+
+// s: string we are searching
+// sep: string to search for
+// R1=&s[0], R2=len(s)
+// R3=&sep[0], R4=len(sep)
+// R5=&ret (int)
+// Caller must confirm availability of vx facility before calling.
+TEXT runtime·indexShortStr(SB),NOSPLIT|NOFRAME,$0
+	CMPBGT	R4, R2, notfound
+	ADD	R1, R2
+	SUB	R4, R2 // R2=&s[len(s)-len(sep)] (last valid index)
+	CMPBEQ	R4, $0, notfound
+	SUB	$1, R4 // R4=len(sep)-1 for use as VLL index
+	VLL	R4, (R3), V0 // contains first 16 bytes of sep
+	MOVD	R1, R7
+index2plus:
+	CMPBNE	R4, $1, index3plus
+	MOVD	$15(R7), R9
+	CMPBGE	R9, R2, index2to16
+	VGBM	$0xaaaa, V31       // 0xff00ff00ff00ff00...
+	VONE	V16
+	VREPH	$0, V0, V1
+	CMPBGE	R9, R2, index2to16
+index2loop:
+	VL	0(R7), V2          // 16 bytes, even indices
+	VL	1(R7), V4          // 16 bytes, odd indices
+	VCEQH	V1, V2, V5         // compare even indices
+	VCEQH	V1, V4, V6         // compare odd indices
+	VSEL	V5, V6, V31, V7    // merge even and odd indices
+	VFEEBS	V16, V7, V17       // find leftmost index, set condition to 1 if found
+	BLT	foundV17
+	MOVD	$16(R7), R7        // R7+=16
+	ADD	$15, R7, R9
+	CMPBLE	R9, R2, index2loop // continue if (R7+15) <= R2 (last index to search)
+	CMPBLE	R7, R2, index2to16
+	BR	notfound
+
+index3plus:
+	CMPBNE	R4, $2, index4plus
+	ADD	$15, R7, R9
+	CMPBGE	R9, R2, index2to16
+	MOVD	$1, R0
+	VGBM	$0xaaaa, V31       // 0xff00ff00ff00ff00...
+	VONE	V16
+	VREPH	$0, V0, V1
+	VREPB	$2, V0, V8
+index3loop:
+	VL	(R7), V2           // load 16-bytes into V2
+	VLL	R0, 16(R7), V3     // load 2-bytes into V3
+	VSLDB	$1, V2, V3, V4     // V4=(V2:V3)<<1
+	VSLDB	$2, V2, V3, V9     // V9=(V2:V3)<<2
+	VCEQH	V1, V2, V5         // compare 2-byte even indices
+	VCEQH	V1, V4, V6         // compare 2-byte odd indices
+	VCEQB	V8, V9, V10        // compare last bytes
+	VSEL	V5, V6, V31, V7    // merge even and odd indices
+	VN	V7, V10, V7        // AND indices with last byte
+	VFEEBS	V16, V7, V17       // find leftmost index, set condition to 1 if found
+	BLT	foundV17
+	MOVD	$16(R7), R7        // R7+=16
+	ADD	$15, R7, R9
+	CMPBLE	R9, R2, index3loop // continue if (R7+15) <= R2 (last index to search)
+	CMPBLE	R7, R2, index2to16
+	BR	notfound
+
+index4plus:
+	CMPBNE	R4, $3, index5plus
+	ADD	$15, R7, R9
+	CMPBGE	R9, R2, index2to16
+	MOVD	$2, R0
+	VGBM	$0x8888, V29       // 0xff000000ff000000...
+	VGBM	$0x2222, V30       // 0x0000ff000000ff00...
+	VGBM	$0xcccc, V31       // 0xffff0000ffff0000...
+	VONE	V16
+	VREPF	$0, V0, V1
+index4loop:
+	VL	(R7), V2           // load 16-bytes into V2
+	VLL	R0, 16(R7), V3     // load 3-bytes into V3
+	VSLDB	$1, V2, V3, V4     // V4=(V2:V3)<<1
+	VSLDB	$2, V2, V3, V9     // V9=(V2:V3)<<1
+	VSLDB	$3, V2, V3, V10    // V10=(V2:V3)<<1
+	VCEQF	V1, V2, V5         // compare index 0, 4, ...
+	VCEQF	V1, V4, V6         // compare index 1, 5, ...
+	VCEQF	V1, V9, V11        // compare index 2, 6, ...
+	VCEQF	V1, V10, V12       // compare index 3, 7, ...
+	VSEL	V5, V6, V29, V13   // merge index 0, 1, 4, 5, ...
+	VSEL	V11, V12, V30, V14 // merge index 2, 3, 6, 7, ...
+	VSEL	V13, V14, V31, V7  // final merge
+	VFEEBS	V16, V7, V17       // find leftmost index, set condition to 1 if found
+	BLT	foundV17
+	MOVD	$16(R7), R7        // R7+=16
+	ADD	$15, R7, R9
+	CMPBLE	R9, R2, index4loop // continue if (R7+15) <= R2 (last index to search)
+	CMPBLE	R7, R2, index2to16
+	BR	notfound
+
+index5plus:
+	CMPBGT	R4, $15, index17plus
+index2to16:
+	CMPBGT	R7, R2, notfound
+	MOVD	$1(R7), R8
+	CMPBGT	R8, R2, index2to16tail
+index2to16loop:
+	// unrolled 2x
+	VLL	R4, (R7), V1
+	VLL	R4, 1(R7), V2
+	VCEQGS	V0, V1, V3
+	BEQ	found
+	MOVD	$1(R7), R7
+	VCEQGS	V0, V2, V4
+	BEQ	found
+	MOVD	$1(R7), R7
+	CMPBLT	R7, R2, index2to16loop
+	CMPBGT	R7, R2, notfound
+index2to16tail:
+	VLL	R4, (R7), V1
+	VCEQGS	V0, V1, V2
+	BEQ	found
+	BR	notfound
+
+index17plus:
+	CMPBGT	R4, $31, index33plus
+	SUB	$16, R4, R0
+	VLL	R0, 16(R3), V1
+	VONE	V7
+index17to32loop:
+	VL	(R7), V2
+	VLL	R0, 16(R7), V3
+	VCEQG	V0, V2, V4
+	VCEQG	V1, V3, V5
+	VN	V4, V5, V6
+	VCEQGS	V6, V7, V8
+	BEQ	found
+	MOVD	$1(R7), R7
+	CMPBLE  R7, R2, index17to32loop
+	BR	notfound
+
+index33plus:
+	CMPBGT	R4, $47, index49plus
+	SUB	$32, R4, R0
+	VL	16(R3), V1
+	VLL	R0, 32(R3), V2
+	VONE	V11
+index33to48loop:
+	VL	(R7), V3
+	VL	16(R7), V4
+	VLL	R0, 32(R7), V5
+	VCEQG	V0, V3, V6
+	VCEQG	V1, V4, V7
+	VCEQG	V2, V5, V8
+	VN	V6, V7, V9
+	VN	V8, V9, V10
+	VCEQGS	V10, V11, V12
+	BEQ	found
+	MOVD	$1(R7), R7
+	CMPBLE  R7, R2, index33to48loop
+	BR	notfound
+
+index49plus:
+	CMPBGT	R4, $63, index65plus
+	SUB	$48, R4, R0
+	VL	16(R3), V1
+	VL	32(R3), V2
+	VLL	R0, 48(R3), V3
+	VONE	V15
+index49to64loop:
+	VL	(R7), V4
+	VL	16(R7), V5
+	VL	32(R7), V6
+	VLL	R0, 48(R7), V7
+	VCEQG	V0, V4, V8
+	VCEQG	V1, V5, V9
+	VCEQG	V2, V6, V10
+	VCEQG	V3, V7, V11
+	VN	V8, V9, V12
+	VN	V10, V11, V13
+	VN	V12, V13, V14
+	VCEQGS	V14, V15, V16
+	BEQ	found
+	MOVD	$1(R7), R7
+	CMPBLE  R7, R2, index49to64loop
+notfound:
+	MOVD	$-1, (R5)
+	RET
+
+index65plus:
+	// not implemented
+	MOVD	$0, (R0)
+	RET
+
+foundV17: // index is in doubleword V17[0]
+	VLGVG	$0, V17, R8
+	ADD	R8, R7
+found:
+	SUB	R1, R7
+	MOVD	R7, (R5)
+	RET
+
 // This is called from .init_array and follows the platform, not Go, ABI.
 // We are overly conservative. We could only save the registers we use.
 // However, since this function is only called once per loaded module
 // performance is unimportant.
 TEXT runtime·addmoduledata(SB),NOSPLIT|NOFRAME,$0-0
-	// Save R6-R15, F0, F2, F4 and F6 in the
-	// register save area of the calling function
+	// Save R6-R15 in the register save area of the calling function.
+	// Don't bother saving F8-F15 as we aren't doing any calls.
 	STMG	R6, R15, 48(R15)
-	FMOVD	F0, 128(R15)
-	FMOVD	F2, 136(R15)
-	FMOVD	F4, 144(R15)
-	FMOVD	F6, 152(R15)
 
 	// append the argument (passed in R2, as per the ELF ABI) to the
 	// moduledata linked list.
@@ -1123,12 +1296,8 @@ TEXT runtime·addmoduledata(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	R2, moduledata_next(R1)
 	MOVD	R2, runtime·lastmoduledatap(SB)
 
-	// Restore R6-R15, F0, F2, F4 and F6
+	// Restore R6-R15.
 	LMG	48(R15), R6, R15
-	FMOVD	F0, 128(R15)
-	FMOVD	F2, 136(R15)
-	FMOVD	F4, 144(R15)
-	FMOVD	F6, 152(R15)
 	RET
 
 TEXT ·checkASM(SB),NOSPLIT,$0-1

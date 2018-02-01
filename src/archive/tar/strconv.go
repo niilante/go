@@ -12,28 +12,34 @@ import (
 	"time"
 )
 
-const maxNanoSecondIntSize = 9
+// hasNUL reports whether the NUL character exists within s.
+func hasNUL(s string) bool {
+	return strings.IndexByte(s, 0) >= 0
+}
 
+// isASCII reports whether the input is an ASCII C-style string.
 func isASCII(s string) bool {
 	for _, c := range s {
-		if c >= 0x80 {
+		if c >= 0x80 || c == 0x00 {
 			return false
 		}
 	}
 	return true
 }
 
+// toASCII converts the input to an ASCII C-style string.
+// This a best effort conversion, so invalid characters are dropped.
 func toASCII(s string) string {
 	if isASCII(s) {
 		return s
 	}
-	var buf bytes.Buffer
+	b := make([]byte, 0, len(s))
 	for _, c := range s {
-		if c < 0x80 {
-			buf.WriteByte(byte(c))
+		if c < 0x80 && c != 0x00 {
+			b = append(b, byte(c))
 		}
 	}
-	return buf.String()
+	return string(b)
 }
 
 type parser struct {
@@ -47,23 +53,28 @@ type formatter struct {
 // parseString parses bytes as a NUL-terminated C-style string.
 // If a NUL byte is not found then the whole slice is returned as a string.
 func (*parser) parseString(b []byte) string {
-	n := 0
-	for n < len(b) && b[n] != 0 {
-		n++
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		return string(b[:i])
 	}
-	return string(b[0:n])
+	return string(b)
 }
 
-// Write s into b, terminating it with a NUL if there is room.
+// formatString copies s into b, NUL-terminating if possible.
 func (f *formatter) formatString(b []byte, s string) {
 	if len(s) > len(b) {
 		f.err = ErrFieldTooLong
-		return
 	}
-	ascii := toASCII(s)
-	copy(b, ascii)
-	if len(ascii) < len(b) {
-		b[len(ascii)] = 0
+	copy(b, s)
+	if len(s) < len(b) {
+		b[len(s)] = 0
+	}
+
+	// Some buggy readers treat regular files with a trailing slash
+	// in the V7 path field as a directory even though the full path
+	// recorded elsewhere (e.g., via PAX record) contains no trailing slash.
+	if len(s) > len(b) && b[len(b)-1] == '/' {
+		n := len(strings.TrimRight(s[:len(b)], "/"))
+		b[n] = 0 // Replace trailing slash with NUL terminator
 	}
 }
 
@@ -75,7 +86,7 @@ func (f *formatter) formatString(b []byte, s string) {
 // that the first byte can only be either 0x80 or 0xff. Thus, the first byte is
 // equivalent to the sign bit in two's complement form.
 func fitsInBase256(n int, x int64) bool {
-	var binBits = uint(n-1) * 8
+	binBits := uint(n-1) * 8
 	return n >= 9 || (x >= -1<<binBits && x < 1<<binBits)
 }
 
@@ -123,8 +134,14 @@ func (p *parser) parseNumeric(b []byte) int64 {
 	return p.parseOctal(b)
 }
 
-// Write x into b, as binary (GNUtar/star extension).
+// formatNumeric encodes x into b using base-8 (octal) encoding if possible.
+// Otherwise it will attempt to use base-256 (binary) encoding.
 func (f *formatter) formatNumeric(b []byte, x int64) {
+	if fitsInOctal(len(b), x) {
+		f.formatOctal(b, x)
+		return
+	}
+
 	if fitsInBase256(len(b), x) {
 		for i := len(b) - 1; i >= 0; i-- {
 			b[i] = byte(x)
@@ -157,6 +174,11 @@ func (p *parser) parseOctal(b []byte) int64 {
 }
 
 func (f *formatter) formatOctal(b []byte, x int64) {
+	if !fitsInOctal(len(b), x) {
+		x = 0 // Last resort, just write zero
+		f.err = ErrFieldTooLong
+	}
+
 	s := strconv.FormatInt(x, 8)
 	// Add leading zeros, but leave room for a NUL.
 	if n := len(b) - len(s) - 1; n > 0 {
@@ -165,50 +187,71 @@ func (f *formatter) formatOctal(b []byte, x int64) {
 	f.formatString(b, s)
 }
 
-// parsePAXTime takes a string of the form %d.%d as described in
-// the PAX specification.
-func parsePAXTime(t string) (time.Time, error) {
-	buf := []byte(t)
-	pos := bytes.IndexByte(buf, '.')
-	var seconds, nanoseconds int64
-	var err error
-	if pos == -1 {
-		seconds, err = strconv.ParseInt(t, 10, 0)
-		if err != nil {
-			return time.Time{}, err
-		}
-	} else {
-		seconds, err = strconv.ParseInt(string(buf[:pos]), 10, 0)
-		if err != nil {
-			return time.Time{}, err
-		}
-		nanoBuf := string(buf[pos+1:])
-		// Pad as needed before converting to a decimal.
-		// For example .030 -> .030000000 -> 30000000 nanoseconds
-		if len(nanoBuf) < maxNanoSecondIntSize {
-			// Right pad
-			nanoBuf += strings.Repeat("0", maxNanoSecondIntSize-len(nanoBuf))
-		} else if len(nanoBuf) > maxNanoSecondIntSize {
-			// Right truncate
-			nanoBuf = nanoBuf[:maxNanoSecondIntSize]
-		}
-		nanoseconds, err = strconv.ParseInt(nanoBuf, 10, 0)
-		if err != nil {
-			return time.Time{}, err
-		}
-	}
-	ts := time.Unix(seconds, nanoseconds)
-	return ts, nil
+// fitsInOctal reports whether the integer x fits in a field n-bytes long
+// using octal encoding with the appropriate NUL terminator.
+func fitsInOctal(n int, x int64) bool {
+	octBits := uint(n-1) * 3
+	return x >= 0 && (n >= 22 || x < 1<<octBits)
 }
 
-// TODO(dsnet): Implement formatPAXTime.
+// parsePAXTime takes a string of the form %d.%d as described in the PAX
+// specification. Note that this implementation allows for negative timestamps,
+// which is allowed for by the PAX specification, but not always portable.
+func parsePAXTime(s string) (time.Time, error) {
+	const maxNanoSecondDigits = 9
+
+	// Split string into seconds and sub-seconds parts.
+	ss, sn := s, ""
+	if pos := strings.IndexByte(s, '.'); pos >= 0 {
+		ss, sn = s[:pos], s[pos+1:]
+	}
+
+	// Parse the seconds.
+	secs, err := strconv.ParseInt(ss, 10, 64)
+	if err != nil {
+		return time.Time{}, ErrHeader
+	}
+	if len(sn) == 0 {
+		return time.Unix(secs, 0), nil // No sub-second values
+	}
+
+	// Parse the nanoseconds.
+	if strings.Trim(sn, "0123456789") != "" {
+		return time.Time{}, ErrHeader
+	}
+	if len(sn) < maxNanoSecondDigits {
+		sn += strings.Repeat("0", maxNanoSecondDigits-len(sn)) // Right pad
+	} else {
+		sn = sn[:maxNanoSecondDigits] // Right truncate
+	}
+	nsecs, _ := strconv.ParseInt(sn, 10, 64) // Must succeed
+	if len(ss) > 0 && ss[0] == '-' {
+		return time.Unix(secs, -1*nsecs), nil // Negative correction
+	}
+	return time.Unix(secs, nsecs), nil
+}
+
+// formatPAXTime converts ts into a time of the form %d.%d as described in the
+// PAX specification. This function is capable of negative timestamps.
+func formatPAXTime(ts time.Time) (s string) {
+	secs, nsecs := ts.Unix(), ts.Nanosecond()
+	if nsecs == 0 {
+		return strconv.FormatInt(secs, 10)
+	}
+
+	// If seconds is negative, then perform correction.
+	sign := ""
+	if secs < 0 {
+		sign = "-"             // Remember sign
+		secs = -(secs + 1)     // Add a second to secs
+		nsecs = -(nsecs - 1E9) // Take that second away from nsecs
+	}
+	return strings.TrimRight(fmt.Sprintf("%s%d.%09d", sign, secs, nsecs), "0")
+}
 
 // parsePAXRecord parses the input PAX record string into a key-value pair.
 // If parsing is successful, it will slice off the currently read record and
 // return the remainder as r.
-//
-// A PAX record is of the following form:
-//	"%d %s=%s\n" % (size, key, value)
 func parsePAXRecord(s string) (k, v, r string, err error) {
 	// The size field ends at the first space.
 	sp := strings.IndexByte(s, ' ')
@@ -233,21 +276,51 @@ func parsePAXRecord(s string) (k, v, r string, err error) {
 	if eq == -1 {
 		return "", "", s, ErrHeader
 	}
-	return rec[:eq], rec[eq+1:], rem, nil
+	k, v = rec[:eq], rec[eq+1:]
+
+	if !validPAXRecord(k, v) {
+		return "", "", s, ErrHeader
+	}
+	return k, v, rem, nil
 }
 
 // formatPAXRecord formats a single PAX record, prefixing it with the
 // appropriate length.
-func formatPAXRecord(k, v string) string {
+func formatPAXRecord(k, v string) (string, error) {
+	if !validPAXRecord(k, v) {
+		return "", ErrHeader
+	}
+
 	const padding = 3 // Extra padding for ' ', '=', and '\n'
 	size := len(k) + len(v) + padding
 	size += len(strconv.Itoa(size))
-	record := fmt.Sprintf("%d %s=%s\n", size, k, v)
+	record := strconv.Itoa(size) + " " + k + "=" + v + "\n"
 
 	// Final adjustment if adding size field increased the record size.
 	if len(record) != size {
 		size = len(record)
-		record = fmt.Sprintf("%d %s=%s\n", size, k, v)
+		record = strconv.Itoa(size) + " " + k + "=" + v + "\n"
 	}
-	return record
+	return record, nil
+}
+
+// validPAXRecord reports whether the key-value pair is valid where each
+// record is formatted as:
+//	"%d %s=%s\n" % (size, key, value)
+//
+// Keys and values should be UTF-8, but the number of bad writers out there
+// forces us to be a more liberal.
+// Thus, we only reject all keys with NUL, and only reject NULs in values
+// for the PAX version of the USTAR string fields.
+// The key must not contain an '=' character.
+func validPAXRecord(k, v string) bool {
+	if k == "" || strings.IndexByte(k, '=') >= 0 {
+		return false
+	}
+	switch k {
+	case paxPath, paxLinkpath, paxUname, paxGname:
+		return !hasNUL(v)
+	default:
+		return !hasNUL(k)
+	}
 }

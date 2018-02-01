@@ -84,9 +84,10 @@ type compressor struct {
 	bulkHasher func([]byte, []uint32)
 
 	// compression algorithm
-	fill func(*compressor, []byte) int // copy data to window
-	step func(*compressor)             // process window
-	sync bool                          // requesting flush
+	fill      func(*compressor, []byte) int // copy data to window
+	step      func(*compressor)             // process window
+	sync      bool                          // requesting flush
+	bestSpeed *deflateFast                  // Encoder for BestSpeed
 
 	// Input hash chains
 	// hashHead[hashValue] contains the largest inputIndex with the specified hash value
@@ -135,14 +136,17 @@ func (d *compressor) fillDeflate(b []byte) int {
 			delta := d.hashOffset - 1
 			d.hashOffset -= delta
 			d.chainHead -= delta
-			for i, v := range d.hashPrev {
+
+			// Iterate over slices instead of arrays to avoid copying
+			// the entire table onto the stack (Issue #18625).
+			for i, v := range d.hashPrev[:] {
 				if int(v) > delta {
 					d.hashPrev[i] = uint32(int(v) - delta)
 				} else {
 					d.hashPrev[i] = 0
 				}
 			}
-			for i, v := range d.hashHead {
+			for i, v := range d.hashHead[:] {
 				if int(v) > delta {
 					d.hashHead[i] = uint32(int(v) - delta)
 				} else {
@@ -346,12 +350,13 @@ func (d *compressor) encSpeed() {
 				d.err = d.w.err
 			}
 			d.windowEnd = 0
+			d.bestSpeed.reset()
 			return
 		}
 
 	}
 	// Encode the block.
-	d.tokens = encodeBestSpeed(d.tokens[:0], d.window[:d.windowEnd])
+	d.tokens = d.bestSpeed.encode(d.tokens[:0], d.window[:d.windowEnd])
 
 	// If we removed less than 1/16th, Huffman compress the block.
 	if len(d.tokens) > d.windowEnd-(d.windowEnd>>4) {
@@ -519,10 +524,10 @@ func (d *compressor) fillStore(b []byte) int {
 }
 
 func (d *compressor) store() {
-	if d.windowEnd > 0 {
+	if d.windowEnd > 0 && (d.windowEnd == maxStoreBlockSize || d.sync) {
 		d.err = d.writeStoredBlock(d.window[:d.windowEnd])
+		d.windowEnd = 0
 	}
-	d.windowEnd = 0
 }
 
 // storeHuff compresses and stores the currently added data
@@ -584,6 +589,7 @@ func (d *compressor) init(w io.Writer, level int) (err error) {
 		d.window = make([]byte, maxStoreBlockSize)
 		d.fill = (*compressor).fillStore
 		d.step = (*compressor).encSpeed
+		d.bestSpeed = newDeflateFast()
 		d.tokens = make([]token, maxStoreBlockSize)
 	case level == DefaultCompression:
 		level = 6
@@ -609,6 +615,7 @@ func (d *compressor) reset(w io.Writer) {
 	case BestSpeed:
 		d.windowEnd = 0
 		d.tokens = d.tokens[:0]
+		d.bestSpeed.reset()
 	default:
 		d.chainHead = -1
 		for i := range d.hashHead {

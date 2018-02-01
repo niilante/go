@@ -270,16 +270,11 @@ func Gethostname() (name string, err error) {
 	return name, err
 }
 
-func UtimesNano(path string, ts []Timespec) (err error) {
+func UtimesNano(path string, ts []Timespec) error {
 	if len(ts) != 2 {
 		return EINVAL
 	}
-	var tv [2]Timeval
-	for i := 0; i < 2; i++ {
-		tv[i].Sec = ts[i].Sec
-		tv[i].Usec = ts[i].Nsec / 1000
-	}
-	return Utimes(path, (*[2]Timeval)(unsafe.Pointer(&tv[0])))
+	return utimensat(_AT_FDCWD, path, (*[2]Timespec)(unsafe.Pointer(&ts[0])), 0)
 }
 
 //sys	fcntl(fd int, cmd int, arg int) (val int, err error)
@@ -441,7 +436,6 @@ func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error) 
 //sys	Chroot(path string) (err error)
 //sys	Close(fd int) (err error)
 //sys	Dup(fd int) (nfd int, err error)
-//sys	Exit(code int)
 //sys	Fchdir(fd int) (err error)
 //sys	Fchmod(fd int, mode uint32) (err error)
 //sys	Fchown(fd int, uid int, gid int) (err error)
@@ -494,7 +488,7 @@ func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error) 
 //sys	Ftruncate(fd int, length int64) (err error)
 //sys	Umask(newmask int) (oldmask int)
 //sys	Unlink(path string) (err error)
-//sys	Utimes(path string, times *[2]Timeval) (err error)
+//sys	utimes(path string, times *[2]Timeval) (err error)
 //sys	bind(s int, addr unsafe.Pointer, addrlen _Socklen) (err error) = libsocket.__xnet_bind
 //sys	connect(s int, addr unsafe.Pointer, addrlen _Socklen) (err error) = libsocket.__xnet_connect
 //sys	mmap(addr uintptr, length uintptr, prot int, flag int, fd int, pos int64) (ret uintptr, err error)
@@ -509,6 +503,22 @@ func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error) 
 //sys	setsockopt(s int, level int, name int, val unsafe.Pointer, vallen uintptr) (err error) = libsocket.setsockopt
 //sys	recvfrom(fd int, p []byte, flags int, from *RawSockaddrAny, fromlen *_Socklen) (n int, err error) = libsocket.recvfrom
 //sys	recvmsg(s int, msg *Msghdr, flags int) (n int, err error) = libsocket.__xnet_recvmsg
+//sys	getexecname() (path unsafe.Pointer, err error) = libc.getexecname
+//sys	utimensat(dirfd int, path string, times *[2]Timespec, flag int) (err error)
+
+func Getexecname() (path string, err error) {
+	ptr, err := getexecname()
+	if err != nil {
+		return "", err
+	}
+	bytes := (*[1 << 29]byte)(ptr)[:]
+	for i, b := range bytes {
+		if b == 0 {
+			return string(bytes[:i]), nil
+		}
+	}
+	panic("unreachable")
+}
 
 func readlen(fd int, buf *byte, nbuf int) (n int, err error) {
 	r0, _, e1 := sysvicall6(uintptr(unsafe.Pointer(&libc_read)), 3, uintptr(fd), uintptr(unsafe.Pointer(buf)), uintptr(nbuf), 0, 0, 0)
@@ -526,4 +536,11 @@ func writelen(fd int, buf *byte, nbuf int) (n int, err error) {
 		err = e1
 	}
 	return
+}
+
+func Utimes(path string, tv []Timeval) error {
+	if len(tv) != 2 {
+		return EINVAL
+	}
+	return utimes(path, (*[2]Timeval)(unsafe.Pointer(&tv[0])))
 }

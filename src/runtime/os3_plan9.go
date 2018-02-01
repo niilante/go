@@ -45,6 +45,11 @@ func sighandler(_ureg *ureg, note *byte, gp *g) int {
 			break
 		}
 	}
+	if flags&_SigPanic != 0 && gp.throwsplit {
+		// We can't safely sigpanic because it may grow the
+		// stack. Abort in the signal handler instead.
+		flags = (flags &^ _SigPanic) | _SigThrow
+	}
 	if flags&_SigGoExit != 0 {
 		exits((*byte)(add(unsafe.Pointer(note), 9))) // Strip "go: exit " prefix.
 	}
@@ -62,7 +67,7 @@ func sighandler(_ureg *ureg, note *byte, gp *g) int {
 		// but we do recognize the top pointer on the stack as code,
 		// then assume this was a call to non-code and treat like
 		// pc == 0, to make unwinding show the context.
-		if pc != 0 && findfunc(pc) == nil && findfunc(*(*uintptr)(unsafe.Pointer(sp))) != nil {
+		if pc != 0 && !findfunc(pc).valid() && findfunc(*(*uintptr)(unsafe.Pointer(sp))).valid() {
 			pc = 0
 		}
 
@@ -100,6 +105,9 @@ func sighandler(_ureg *ureg, note *byte, gp *g) int {
 		return _NCONT
 	}
 	if flags&_SigNotify != 0 {
+		if ignoredNote(note) {
+			return _NCONT
+		}
 		if sendNote(note) {
 			return _NCONT
 		}
@@ -143,7 +151,13 @@ func sigdisable(sig uint32) {
 func sigignore(sig uint32) {
 }
 
-func resetcpuprofiler(hz int32) {
+func setProcessCPUProfiler(hz int32) {
+}
+
+func setThreadCPUProfiler(hz int32) {
 	// TODO: Enable profiling interrupts.
 	getg().m.profilehz = hz
 }
+
+// gsignalStack is unused on Plan 9.
+type gsignalStack struct{}

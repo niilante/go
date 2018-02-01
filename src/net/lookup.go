@@ -8,6 +8,7 @@ import (
 	"context"
 	"internal/nettrace"
 	"internal/singleflight"
+	"sync"
 )
 
 // protocols contains minimal mappings between internet protocol
@@ -28,6 +29,9 @@ var protocols = map[string]int{
 // services contains minimal mappings between services names and port
 // numbers for platforms that don't have a complete list of port numbers
 // (some Solaris distros, nacl, etc).
+//
+// See https://www.iana.org/assignments/service-names-port-numbers
+//
 // On Unix, this map is augmented by readServices via goLookupPort.
 var services = map[string]map[string]int{
 	"udp": {
@@ -50,6 +54,10 @@ var services = map[string]map[string]int{
 	},
 }
 
+// dnsWaitGroup can be used by tests to wait for all DNS goroutines to
+// complete. This avoids races on the test hooks.
+var dnsWaitGroup sync.WaitGroup
+
 const maxProtoLength = len("RSVP-E2E-IGNORE") + 10 // with room to grow
 
 func lookupProtocolMap(name string) (int, error) {
@@ -63,7 +71,12 @@ func lookupProtocolMap(name string) (int, error) {
 	return proto, nil
 }
 
-const maxServiceLength = len("mobility-header") + 10 // with room to grow
+// maxPortBufSize is the longest reasonable name of a service
+// (non-numeric port).
+// Currently the longest known IANA-unregistered name is
+// "mobility-header", so we use that length, plus some slop in case
+// something longer is added in the future.
+const maxPortBufSize = len("mobility-header") + 10
 
 func lookupPortMap(network, service string) (port int, error error) {
 	switch network {
@@ -74,7 +87,7 @@ func lookupPortMap(network, service string) (port int, error error) {
 	}
 
 	if m, ok := services[network]; ok {
-		var lowerService [maxServiceLength]byte
+		var lowerService [maxPortBufSize]byte
 		n := copy(lowerService[:], service)
 		lowerASCIIBytes(lowerService[:n])
 		if port, ok := m[string(lowerService[:n])]; ok && n == len(service) {
@@ -97,15 +110,31 @@ type Resolver struct {
 	// GODEBUG=netdns=go, but scoped to just this resolver.
 	PreferGo bool
 
+	// StrictErrors controls the behavior of temporary errors
+	// (including timeout, socket errors, and SERVFAIL) when using
+	// Go's built-in resolver. For a query composed of multiple
+	// sub-queries (such as an A+AAAA address lookup, or walking the
+	// DNS search list), this option causes such errors to abort the
+	// whole query instead of returning a partial result. This is
+	// not enabled by default because it may affect compatibility
+	// with resolvers that process AAAA queries incorrectly.
+	StrictErrors bool
+
+	// Dial optionally specifies an alternate dialer for use by
+	// Go's built-in DNS resolver to make TCP and UDP connections
+	// to DNS services. The host in the address parameter will
+	// always be a literal IP address and not a host name, and the
+	// port in the address parameter will be a literal port number
+	// and not a service name.
+	// If the Conn returned is also a PacketConn, sent and received DNS
+	// messages must adhere to RFC 1035 section 4.2.1, "UDP usage".
+	// Otherwise, DNS messages transmitted over Conn must adhere
+	// to RFC 7766 section 5, "Transport Protocol Selection".
+	// If nil, the default dialer is used.
+	Dial func(ctx context.Context, network, address string) (Conn, error)
+
 	// TODO(bradfitz): optional interface impl override hook
 	// TODO(bradfitz): Timeout time.Duration?
-}
-
-func (r *Resolver) lookupIPFunc() func(context.Context, string) ([]IPAddr, error) {
-	if r != nil && r.PreferGo {
-		return goLookupIP
-	}
-	return lookupIP
 }
 
 // LookupHost looks up the given host using the local resolver.
@@ -125,7 +154,7 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string,
 	if ip := ParseIP(host); ip != nil {
 		return []string{host}, nil
 	}
-	return lookupHost(ctx, host)
+	return r.lookupHost(ctx, host)
 }
 
 // LookupIP looks up host using the local resolver.
@@ -160,23 +189,31 @@ func (r *Resolver) LookupIPAddr(ctx context.Context, host string) ([]IPAddr, err
 	// The underlying resolver func is lookupIP by default but it
 	// can be overridden by tests. This is needed by net/http, so it
 	// uses a context key instead of unexported variables.
-	resolverFunc := r.lookupIPFunc()
+	resolverFunc := r.lookupIP
 	if alt, _ := ctx.Value(nettrace.LookupIPAltResolverKey{}).(func(context.Context, string) ([]IPAddr, error)); alt != nil {
 		resolverFunc = alt
 	}
 
-	ch := lookupGroup.DoChan(host, func() (interface{}, error) {
+	dnsWaitGroup.Add(1)
+	ch, called := lookupGroup.DoChan(host, func() (interface{}, error) {
+		defer dnsWaitGroup.Done()
 		return testHookLookupIP(ctx, resolverFunc, host)
 	})
+	if !called {
+		dnsWaitGroup.Done()
+	}
 
 	select {
 	case <-ctx.Done():
-		// The DNS lookup timed out for some reason. Force
+		// If the DNS lookup timed out for some reason, force
 		// future requests to start the DNS lookup again
 		// rather than waiting for the current lookup to
 		// complete. See issue 8602.
-		err := mapErr(ctx.Err())
-		lookupGroup.Forget(host)
+		ctxErr := ctx.Err()
+		if ctxErr == context.DeadlineExceeded {
+			lookupGroup.Forget(host)
+		}
+		err := mapErr(ctxErr)
 		if trace != nil && trace.DNSDone != nil {
 			trace.DNSDone(nil, false, err)
 		}
@@ -229,7 +266,7 @@ func LookupPort(network, service string) (port int, err error) {
 func (r *Resolver) LookupPort(ctx context.Context, network, service string) (port int, err error) {
 	port, needsLookup := parsePort(service)
 	if needsLookup {
-		port, err = lookupPort(ctx, network, service)
+		port, err = r.lookupPort(ctx, network, service)
 		if err != nil {
 			return 0, err
 		}
@@ -240,20 +277,32 @@ func (r *Resolver) LookupPort(ctx context.Context, network, service string) (por
 	return port, nil
 }
 
-// LookupCNAME returns the canonical DNS host for the given name.
+// LookupCNAME returns the canonical name for the given host.
 // Callers that do not care about the canonical name can call
 // LookupHost or LookupIP directly; both take care of resolving
 // the canonical name as part of the lookup.
-func LookupCNAME(name string) (cname string, err error) {
-	return lookupCNAME(context.Background(), name)
+//
+// A canonical name is the final name after following zero
+// or more CNAME records.
+// LookupCNAME does not return an error if host does not
+// contain DNS "CNAME" records, as long as host resolves to
+// address records.
+func LookupCNAME(host string) (cname string, err error) {
+	return DefaultResolver.lookupCNAME(context.Background(), host)
 }
 
-// LookupCNAME returns the canonical DNS host for the given name.
+// LookupCNAME returns the canonical name for the given host.
 // Callers that do not care about the canonical name can call
 // LookupHost or LookupIP directly; both take care of resolving
 // the canonical name as part of the lookup.
-func (r *Resolver) LookupCNAME(ctx context.Context, name string) (cname string, err error) {
-	return lookupCNAME(ctx, name)
+//
+// A canonical name is the final name after following zero
+// or more CNAME records.
+// LookupCNAME does not return an error if host does not
+// contain DNS "CNAME" records, as long as host resolves to
+// address records.
+func (r *Resolver) LookupCNAME(ctx context.Context, host string) (cname string, err error) {
+	return r.lookupCNAME(ctx, host)
 }
 
 // LookupSRV tries to resolve an SRV query of the given service,
@@ -266,7 +315,7 @@ func (r *Resolver) LookupCNAME(ctx context.Context, name string) (cname string, 
 // publishing SRV records under non-standard names, if both service
 // and proto are empty strings, LookupSRV looks up name directly.
 func LookupSRV(service, proto, name string) (cname string, addrs []*SRV, err error) {
-	return lookupSRV(context.Background(), service, proto, name)
+	return DefaultResolver.lookupSRV(context.Background(), service, proto, name)
 }
 
 // LookupSRV tries to resolve an SRV query of the given service,
@@ -279,47 +328,50 @@ func LookupSRV(service, proto, name string) (cname string, addrs []*SRV, err err
 // publishing SRV records under non-standard names, if both service
 // and proto are empty strings, LookupSRV looks up name directly.
 func (r *Resolver) LookupSRV(ctx context.Context, service, proto, name string) (cname string, addrs []*SRV, err error) {
-	return lookupSRV(ctx, service, proto, name)
+	return r.lookupSRV(ctx, service, proto, name)
 }
 
 // LookupMX returns the DNS MX records for the given domain name sorted by preference.
 func LookupMX(name string) ([]*MX, error) {
-	return lookupMX(context.Background(), name)
+	return DefaultResolver.lookupMX(context.Background(), name)
 }
 
 // LookupMX returns the DNS MX records for the given domain name sorted by preference.
 func (r *Resolver) LookupMX(ctx context.Context, name string) ([]*MX, error) {
-	return lookupMX(ctx, name)
+	return r.lookupMX(ctx, name)
 }
 
 // LookupNS returns the DNS NS records for the given domain name.
 func LookupNS(name string) ([]*NS, error) {
-	return lookupNS(context.Background(), name)
+	return DefaultResolver.lookupNS(context.Background(), name)
 }
 
 // LookupNS returns the DNS NS records for the given domain name.
 func (r *Resolver) LookupNS(ctx context.Context, name string) ([]*NS, error) {
-	return lookupNS(ctx, name)
+	return r.lookupNS(ctx, name)
 }
 
 // LookupTXT returns the DNS TXT records for the given domain name.
 func LookupTXT(name string) ([]string, error) {
-	return lookupTXT(context.Background(), name)
+	return DefaultResolver.lookupTXT(context.Background(), name)
 }
 
 // LookupTXT returns the DNS TXT records for the given domain name.
 func (r *Resolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
-	return lookupTXT(ctx, name)
+	return r.lookupTXT(ctx, name)
 }
 
 // LookupAddr performs a reverse lookup for the given address, returning a list
 // of names mapping to that address.
+//
+// When using the host C library resolver, at most one result will be
+// returned. To bypass the host resolver, use a custom Resolver.
 func LookupAddr(addr string) (names []string, err error) {
-	return lookupAddr(context.Background(), addr)
+	return DefaultResolver.lookupAddr(context.Background(), addr)
 }
 
 // LookupAddr performs a reverse lookup for the given address, returning a list
 // of names mapping to that address.
 func (r *Resolver) LookupAddr(ctx context.Context, addr string) (names []string, err error) {
-	return lookupAddr(ctx, addr)
+	return r.lookupAddr(ctx, addr)
 }

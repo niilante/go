@@ -4,37 +4,32 @@
 
 package syntax
 
+import "cmd/internal/src"
+
 // ----------------------------------------------------------------------------
 // Nodes
 
 type Node interface {
-	Line() uint32
+	// Pos() returns the position associated with the node as follows:
+	// 1) The position of a node representing a terminal syntax production
+	//    (Name, BasicLit, etc.) is the position of the respective production
+	//    in the source.
+	// 2) The position of a node representing a non-terminal production
+	//    (IndexExpr, IfStmt, etc.) is the position of a token uniquely
+	//    associated with that production; usually the left-most one
+	//    ('[' for IndexExpr, 'if' for IfStmt, etc.)
+	Pos() src.Pos
 	aNode()
-	init(p *parser)
 }
 
 type node struct {
-	doc  *Comment // nil means no comment(s) attached
-	pos  uint32
-	line uint32
+	// commented out for now since not yet used
+	// doc  *Comment // nil means no comment(s) attached
+	pos src.Pos
 }
 
-func (*node) aNode() {}
-
-func (n *node) Line() uint32 {
-	return n.line
-}
-
-// TODO(gri) clean up init/initFrom once we have a good file pos story
-func (n *node) init(p *parser) {
-	n.pos = uint32(p.pos)
-	n.line = uint32(p.line)
-}
-
-func (n *node) initFrom(a *node) {
-	n.pos = a.pos
-	n.line = a.line
-}
+func (n *node) Pos() src.Pos { return n.pos }
+func (*node) aNode()         {}
 
 // ----------------------------------------------------------------------------
 // Files
@@ -43,7 +38,7 @@ func (n *node) initFrom(a *node) {
 type File struct {
 	PkgName  *Name
 	DeclList []Decl
-	Lines    int
+	Lines    uint
 	node
 }
 
@@ -65,15 +60,6 @@ type (
 		decl
 	}
 
-	// Name => Orig
-	AliasDecl struct {
-		Tok   token // Const, Type, Var, or Func
-		Name  *Name
-		Orig  Expr
-		Group *Group // nil means not part of a group
-		decl
-	}
-
 	// NameList
 	// NameList      = Values
 	// NameList Type = Values
@@ -87,10 +73,11 @@ type (
 
 	// Name Type
 	TypeDecl struct {
-		Name  *Name
-		Type  Expr
-		Alias bool
-		Group *Group // nil means not part of a group
+		Name   *Name
+		Alias  bool
+		Type   Expr
+		Group  *Group // nil means not part of a group
+		Pragma Pragma
 		decl
 	}
 
@@ -110,13 +97,12 @@ type (
 	// func Receiver Name Type { Body }
 	// func Receiver Name Type
 	FuncDecl struct {
-		Attr    map[string]bool // go:attr map
-		Recv    *Field          // nil means regular function
-		Name    *Name
-		Type    *FuncType
-		Body    []Stmt // nil means no body (forward declaration)
-		Pragma  Pragma // TODO(mdempsky): Cleaner solution.
-		EndLine uint32 // TODO(mdempsky): Cleaner solution.
+		Attr   map[string]bool // go:attr map
+		Recv   *Field          // nil means regular function
+		Name   *Name
+		Type   *FuncType
+		Body   *BlockStmt // nil means no body (forward declaration)
+		Pragma Pragma     // TODO(mdempsky): Cleaner solution.
 		decl
 	}
 )
@@ -139,6 +125,12 @@ type (
 		aExpr()
 	}
 
+	// Placeholder for an expression that failed to parse
+	// correctly and where we can't provide a better node.
+	BadExpr struct {
+		expr
+	}
+
 	// Value
 	Name struct {
 		Value string
@@ -156,8 +148,8 @@ type (
 	CompositeLit struct {
 		Type     Expr // nil means no literal type
 		ElemList []Expr
-		NKeys    int    // number of elements with keys
-		EndLine  uint32 // TODO(mdempsky): Cleaner solution.
+		NKeys    int // number of elements with keys
+		Rbrace   src.Pos
 		expr
 	}
 
@@ -169,9 +161,8 @@ type (
 
 	// func Type { Body }
 	FuncLit struct {
-		Type    *FuncType
-		Body    []Stmt
-		EndLine uint32 // TODO(mdempsky): Cleaner solution.
+		Type *FuncType
+		Body *BlockStmt
 		expr
 	}
 
@@ -336,7 +327,8 @@ type (
 	}
 
 	BlockStmt struct {
-		Body []Stmt
+		List   []Stmt
+		Rbrace src.Pos
 		stmt
 	}
 
@@ -364,6 +356,12 @@ type (
 	BranchStmt struct {
 		Tok   token // Break, Continue, Fallthrough, or Goto
 		Label *Name
+		// Target is the continuation of the control flow after executing
+		// the branch; it is computed by the parser if CheckBranches is set.
+		// Target is a *LabeledStmt for gotos, and a *SwitchStmt, *SelectStmt,
+		// or *ForStmt for breaks and continues, depending on the context of
+		// the branch. Target is not set for fallthroughs.
+		Target Stmt
 		stmt
 	}
 
@@ -381,7 +379,7 @@ type (
 	IfStmt struct {
 		Init SimpleStmt
 		Cond Expr
-		Then []Stmt
+		Then *BlockStmt
 		Else Stmt // either *IfStmt or *BlockStmt
 		stmt
 	}
@@ -390,19 +388,21 @@ type (
 		Init SimpleStmt // incl. *RangeClause
 		Cond Expr
 		Post SimpleStmt
-		Body []Stmt
+		Body *BlockStmt
 		stmt
 	}
 
 	SwitchStmt struct {
-		Init SimpleStmt
-		Tag  Expr
-		Body []*CaseClause
+		Init   SimpleStmt
+		Tag    Expr
+		Body   []*CaseClause
+		Rbrace src.Pos
 		stmt
 	}
 
 	SelectStmt struct {
-		Body []*CommClause
+		Body   []*CommClause
+		Rbrace src.Pos
 		stmt
 	}
 )
@@ -425,12 +425,14 @@ type (
 	CaseClause struct {
 		Cases Expr // nil means default clause
 		Body  []Stmt
+		Colon src.Pos
 		node
 	}
 
 	CommClause struct {
-		Comm SimpleStmt // send or receive stmt; nil means default clause
-		Body []Stmt
+		Comm  SimpleStmt // send or receive stmt; nil means default clause
+		Body  []Stmt
+		Colon src.Pos
 		node
 	}
 )

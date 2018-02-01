@@ -29,7 +29,9 @@
 
 package mips
 
-import "cmd/internal/obj"
+import (
+	"cmd/internal/obj"
+)
 
 //go:generate go run ../stringer.go -i $GOFILE -o anames.go -p mips
 
@@ -44,7 +46,7 @@ const (
 )
 
 const (
-	REG_R0 = obj.RBaseMIPS64 + iota
+	REG_R0 = obj.RBaseMIPS + iota
 	REG_R1
 	REG_R2
 	REG_R3
@@ -258,7 +260,7 @@ const (
 )
 
 const (
-	AABSD = obj.ABaseMIPS64 + obj.A_ARCHSPECIFIC + iota
+	AABSD = obj.ABaseMIPS + obj.A_ARCHSPECIFIC + iota
 	AABSF
 	AABSW
 	AADD
@@ -278,6 +280,12 @@ const (
 	ABLTZAL
 	ABNE
 	ABREAK
+	ACLO
+	ACLZ
+	ACMOVF
+	ACMOVN
+	ACMOVT
+	ACMOVZ
 	ACMPEQD
 	ACMPEQF
 	ACMPGED
@@ -290,6 +298,8 @@ const (
 	ADIVU
 	ADIVW
 	AGOK
+	ALL
+	ALLV
 	ALUI
 	AMOVB
 	AMOVBU
@@ -314,14 +324,19 @@ const (
 	ANEGD
 	ANEGF
 	ANEGW
+	ANOOP // hardware nop
 	ANOR
 	AOR
 	AREM
 	AREMU
 	ARFE
+	ASC
+	ASCV
 	ASGT
 	ASGTU
 	ASLL
+	ASQRTD
+	ASQRTF
 	ASRA
 	ASRL
 	ASUB
@@ -329,11 +344,14 @@ const (
 	ASUBF
 	ASUBU
 	ASUBW
+	ASYNC
 	ASYSCALL
+	ATEQ
 	ATLBP
 	ATLBR
 	ATLBWI
 	ATLBWR
+	ATNE
 	AWORD
 	AXOR
 

@@ -22,7 +22,8 @@ import (
 )
 
 // Unmarshal parses the JSON-encoded data and stores the result
-// in the value pointed to by v.
+// in the value pointed to by v. If v is nil or not a pointer,
+// Unmarshal returns an InvalidUnmarshalError.
 //
 // Unmarshal uses the inverse of the encodings that
 // Marshal uses, allocating maps, slices, and pointers as necessary,
@@ -34,10 +35,18 @@ import (
 // the value pointed at by the pointer. If the pointer is nil, Unmarshal
 // allocates a new value for it to point to.
 //
+// To unmarshal JSON into a value implementing the Unmarshaler interface,
+// Unmarshal calls that value's UnmarshalJSON method, including
+// when the input is a JSON null.
+// Otherwise, if the value implements encoding.TextUnmarshaler
+// and the input is a JSON quoted string, Unmarshal calls that value's
+// UnmarshalText method with the unquoted form of the string.
+//
 // To unmarshal JSON into a struct, Unmarshal matches incoming object
 // keys to the keys used by Marshal (either the struct field name or its tag),
-// preferring an exact match but also accepting a case-insensitive match.
-// Unmarshal will only set exported fields of the struct.
+// preferring an exact match but also accepting a case-insensitive match. By
+// default, object keys which don't have a corresponding struct field are
+// ignored (see Decoder.DisallowUnknownFields for an alternative).
 //
 // To unmarshal JSON into an interface value,
 // Unmarshal stores one of these in the interface value:
@@ -63,15 +72,17 @@ import (
 //
 // To unmarshal a JSON object into a map, Unmarshal first establishes a map to
 // use. If the map is nil, Unmarshal allocates a new map. Otherwise Unmarshal
-// reuses the existing map, keeping existing entries. Unmarshal then stores key-
-// value pairs from the JSON object into the map. The map's key type must
+// reuses the existing map, keeping existing entries. Unmarshal then stores
+// key-value pairs from the JSON object into the map. The map's key type must
 // either be a string, an integer, or implement encoding.TextUnmarshaler.
 //
 // If a JSON value is not appropriate for a given target type,
 // or if a JSON number overflows the target type, Unmarshal
 // skips that field and completes the unmarshaling as best it can.
 // If no more serious errors are encountered, Unmarshal returns
-// an UnmarshalTypeError describing the earliest such error.
+// an UnmarshalTypeError describing the earliest such error. In any
+// case, it's not guaranteed that all the remaining fields following
+// the problematic one will be unmarshaled into the target object.
 //
 // The JSON null value unmarshals into an interface, map, pointer, or slice
 // by setting that Go value to nil. Because null is often used in JSON to mean
@@ -102,6 +113,9 @@ func Unmarshal(data []byte, v interface{}) error {
 // The input can be assumed to be a valid encoding of
 // a JSON value. UnmarshalJSON must copy the JSON data
 // if it wishes to retain the data after returning.
+//
+// By convention, to approximate the behavior of Unmarshal itself,
+// Unmarshalers implement UnmarshalJSON([]byte("null")) as a no-op.
 type Unmarshaler interface {
 	UnmarshalJSON([]byte) error
 }
@@ -125,7 +139,8 @@ func (e *UnmarshalTypeError) Error() string {
 
 // An UnmarshalFieldError describes a JSON object key that
 // led to an unexported (and therefore unwritable) struct field.
-// (No longer used; kept for compatibility.)
+//
+// Deprecated: No longer used; kept for compatibility.
 type UnmarshalFieldError struct {
 	Key   string
 	Type  reflect.Type
@@ -261,8 +276,9 @@ type decodeState struct {
 		Struct string
 		Field  string
 	}
-	savedError error
-	useNumber  bool
+	savedError            error
+	useNumber             bool
+	disallowUnknownFields bool
 }
 
 // errPhase is used for errors that should not happen unless
@@ -458,8 +474,10 @@ func (d *decodeState) indirect(v reflect.Value, decodingNull bool) (Unmarshaler,
 			if u, ok := v.Interface().(Unmarshaler); ok {
 				return u, nil, reflect.Value{}
 			}
-			if u, ok := v.Interface().(encoding.TextUnmarshaler); ok {
-				return nil, u, reflect.Value{}
+			if !decodingNull {
+				if u, ok := v.Interface().(encoding.TextUnmarshaler); ok {
+					return nil, u, reflect.Value{}
+				}
 			}
 		}
 		v = v.Elem()
@@ -493,7 +511,7 @@ func (d *decodeState) array(v reflect.Value) {
 	switch v.Kind() {
 	case reflect.Interface:
 		if v.NumMethod() == 0 {
-			// Decoding into nil interface?  Switch to non-reflect code.
+			// Decoding into nil interface? Switch to non-reflect code.
 			v.Set(reflect.ValueOf(d.arrayInterface()))
 			return
 		}
@@ -597,7 +615,7 @@ func (d *decodeState) object(v reflect.Value) {
 	}
 	v = pv
 
-	// Decoding into nil interface?  Switch to non-reflect code.
+	// Decoding into nil interface? Switch to non-reflect code.
 	if v.Kind() == reflect.Interface && v.NumMethod() == 0 {
 		v.Set(reflect.ValueOf(d.objectInterface()))
 		return
@@ -689,6 +707,19 @@ func (d *decodeState) object(v reflect.Value) {
 				for _, i := range f.index {
 					if subv.Kind() == reflect.Ptr {
 						if subv.IsNil() {
+							// If a struct embeds a pointer to an unexported type,
+							// it is not possible to set a newly allocated value
+							// since the field is unexported.
+							//
+							// See https://golang.org/issue/21357
+							if !subv.CanSet() {
+								d.saveError(fmt.Errorf("json: cannot set embedded pointer to unexported struct: %v", subv.Type().Elem()))
+								// Invalidate subv to ensure d.value(subv) skips over
+								// the JSON value without assigning it to subv.
+								subv = reflect.Value{}
+								destring = false
+								break
+							}
 							subv.Set(reflect.New(subv.Type().Elem()))
 						}
 						subv = subv.Elem()
@@ -697,6 +728,8 @@ func (d *decodeState) object(v reflect.Value) {
 				}
 				d.errorContext.Field = f.name
 				d.errorContext.Struct = v.Type().Name()
+			} else if d.disallowUnknownFields {
+				d.saveError(fmt.Errorf("json: unknown field %q", key))
 			}
 		}
 
@@ -814,8 +847,8 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 		d.saveError(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
 		return
 	}
-	wantptr := item[0] == 'n' // null
-	u, ut, pv := d.indirect(v, wantptr)
+	isNull := item[0] == 'n' // null
+	u, ut, pv := d.indirect(v, isNull)
 	if u != nil {
 		err := u.UnmarshalJSON(item)
 		if err != nil {
@@ -828,7 +861,16 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 			if fromQuoted {
 				d.saveError(fmt.Errorf("json: invalid use of ,string struct tag, trying to unmarshal %q into %v", item, v.Type()))
 			} else {
-				d.saveError(&UnmarshalTypeError{Value: "string", Type: v.Type(), Offset: int64(d.off)})
+				var val string
+				switch item[0] {
+				case 'n':
+					val = "null"
+				case 't', 'f':
+					val = "bool"
+				default:
+					val = "number"
+				}
+				d.saveError(&UnmarshalTypeError{Value: val, Type: v.Type(), Offset: int64(d.off)})
 			}
 			return
 		}
@@ -1119,11 +1161,21 @@ func getu4(s []byte) rune {
 	if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
 		return -1
 	}
-	r, err := strconv.ParseUint(string(s[2:6]), 16, 64)
-	if err != nil {
-		return -1
+	var r rune
+	for _, c := range s[2:6] {
+		switch {
+		case '0' <= c && c <= '9':
+			c = c - '0'
+		case 'a' <= c && c <= 'f':
+			c = c - 'a' + 10
+		case 'A' <= c && c <= 'F':
+			c = c - 'A' + 10
+		default:
+			return -1
+		}
+		r = r*16 + rune(c)
 	}
-	return rune(r)
+	return r
 }
 
 // unquote converts a quoted JSON string literal s into an actual string t.
@@ -1166,7 +1218,7 @@ func unquoteBytes(s []byte) (t []byte, ok bool) {
 	b := make([]byte, len(s)+2*utf8.UTFMax)
 	w := copy(b, s[0:r])
 	for r < len(s) {
-		// Out of room?  Can only happen if s is full of
+		// Out of room? Can only happen if s is full of
 		// malformed UTF-8 and we're replacing each
 		// byte with RuneError.
 		if w >= len(b)-2*utf8.UTFMax {

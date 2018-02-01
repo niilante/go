@@ -5,34 +5,84 @@
 package syntax
 
 import (
+	"cmd/internal/src"
 	"fmt"
 	"io"
 	"os"
 )
 
+// Mode describes the parser mode.
 type Mode uint
 
-// A Pragma value is a set of flags that augment a function
-// declaration. Callers may assign meaning to the flags as
+// Modes supported by the parser.
+const (
+	CheckBranches Mode = 1 << iota // check correct use of labels, break, continue, and goto statements
+)
+
+// Error describes a syntax error. Error implements the error interface.
+type Error struct {
+	Pos src.Pos
+	Msg string
+}
+
+func (err Error) Error() string {
+	return fmt.Sprintf("%s: %s", err.Pos, err.Msg)
+}
+
+var _ error = Error{} // verify that Error implements error
+
+// An ErrorHandler is called for each error encountered reading a .go file.
+type ErrorHandler func(err error)
+
+// A Pragma value is a set of flags that augment a function or
+// type declaration. Callers may assign meaning to the flags as
 // appropriate.
 type Pragma uint16
 
-type ErrorHandler func(pos, line int, msg string)
-
-// A PragmaHandler is used to process //line and //go: directives as
+// A PragmaHandler is used to process //go: directives as
 // they're scanned. The returned Pragma value will be unioned into the
 // next FuncDecl node.
-type PragmaHandler func(pos, line int, text string) Pragma
+type PragmaHandler func(pos src.Pos, text string) Pragma
 
-// TODO(gri) These need a lot more work.
+// A FilenameHandler is used to process each filename encountered
+// in //line directives. The returned value is used as the absolute filename.
+type FilenameHandler func(name string) string
 
-func ReadFile(filename string, errh ErrorHandler, pragh PragmaHandler, mode Mode) (*File, error) {
-	src, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer src.Close()
-	return Read(src, errh, pragh, mode)
+// Parse parses a single Go source file from src and returns the corresponding
+// syntax tree. If there are errors, Parse will return the first error found,
+// and a possibly partially constructed syntax tree, or nil if no correct package
+// clause was found. The base argument is only used for position information.
+//
+// If errh != nil, it is called with each error encountered, and Parse will
+// process as much source as possible. If errh is nil, Parse will terminate
+// immediately upon encountering an error.
+//
+// If a PragmaHandler is provided, it is called with each pragma encountered.
+//
+// If a FilenameHandler is provided, it is called to process each filename
+// encountered in //line directives.
+//
+// The Mode argument is currently ignored.
+func Parse(base *src.PosBase, src io.Reader, errh ErrorHandler, pragh PragmaHandler, fileh FilenameHandler, mode Mode) (_ *File, first error) {
+	defer func() {
+		if p := recover(); p != nil {
+			if err, ok := p.(Error); ok {
+				first = err
+				return
+			}
+			panic(p)
+		}
+	}()
+
+	var p parser
+	p.init(base, src, errh, pragh, fileh, mode)
+	p.next()
+	return p.fileOrNil(), p.first
+}
+
+// ParseBytes behaves like Parse but it reads the source from the []byte slice provided.
+func ParseBytes(base *src.PosBase, src []byte, errh ErrorHandler, pragh PragmaHandler, fileh FilenameHandler, mode Mode) (*File, error) {
+	return Parse(base, &bytesReader{src}, errh, pragh, fileh, mode)
 }
 
 type bytesReader struct {
@@ -48,24 +98,15 @@ func (r *bytesReader) Read(p []byte) (int, error) {
 	return 0, io.EOF
 }
 
-func ReadBytes(src []byte, errh ErrorHandler, pragh PragmaHandler, mode Mode) (*File, error) {
-	return Read(&bytesReader{src}, errh, pragh, mode)
-}
-
-func Read(src io.Reader, errh ErrorHandler, pragh PragmaHandler, mode Mode) (*File, error) {
-	var p parser
-	p.init(src, errh, pragh)
-
-	p.next()
-	ast := p.file()
-
-	if errh == nil && p.nerrors > 0 {
-		return nil, fmt.Errorf("%d syntax errors", p.nerrors)
+// ParseFile behaves like Parse but it reads the source from the named file.
+func ParseFile(filename string, errh ErrorHandler, pragh PragmaHandler, mode Mode) (*File, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		if errh != nil {
+			errh(err)
+		}
+		return nil, err
 	}
-
-	return ast, nil
-}
-
-func Write(w io.Writer, n *File) error {
-	panic("unimplemented")
+	defer f.Close()
+	return Parse(src.NewFileBase(filename, filename), f, errh, pragh, nil, mode)
 }

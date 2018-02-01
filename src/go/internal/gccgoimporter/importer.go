@@ -63,6 +63,7 @@ func findExportFile(searchpaths []string, pkgpath string) (string, error) {
 
 const (
 	gccgov1Magic    = "v1;\n"
+	gccgov2Magic    = "v2;\n"
 	goimporterMagic = "\n$$ "
 	archiveMagic    = "!<ar"
 )
@@ -91,7 +92,7 @@ func openExportFile(fpath string) (reader io.ReadSeeker, closer io.Closer, err e
 
 	var elfreader io.ReaderAt
 	switch string(magic[:]) {
-	case gccgov1Magic, goimporterMagic:
+	case gccgov1Magic, gccgov2Magic, goimporterMagic:
 		// Raw export data.
 		reader = f
 		return
@@ -136,25 +137,53 @@ func openExportFile(fpath string) (reader io.ReadSeeker, closer io.Closer, err e
 // the map entry. Otherwise, the importer must load the package data for the
 // given path into a new *Package, record it in imports map, and return the
 // package.
-type Importer func(imports map[string]*types.Package, path string) (*types.Package, error)
+type Importer func(imports map[string]*types.Package, path, srcDir string, lookup func(string) (io.ReadCloser, error)) (*types.Package, error)
 
 func GetImporter(searchpaths []string, initmap map[*types.Package]InitData) Importer {
-	return func(imports map[string]*types.Package, pkgpath string) (pkg *types.Package, err error) {
+	return func(imports map[string]*types.Package, pkgpath, srcDir string, lookup func(string) (io.ReadCloser, error)) (pkg *types.Package, err error) {
+		// TODO(gri): Use srcDir.
+		// Or not. It's possible that srcDir will fade in importance as
+		// the go command and other tools provide a translation table
+		// for relative imports (like ./foo or vendored imports).
 		if pkgpath == "unsafe" {
 			return types.Unsafe, nil
 		}
 
-		fpath, err := findExportFile(searchpaths, pkgpath)
-		if err != nil {
-			return
-		}
+		var reader io.ReadSeeker
+		var fpath string
+		if lookup != nil {
+			if p := imports[pkgpath]; p != nil && p.Complete() {
+				return p, nil
+			}
+			rc, err := lookup(pkgpath)
+			if err != nil {
+				return nil, err
+			}
+			defer rc.Close()
+			rs, ok := rc.(io.ReadSeeker)
+			if !ok {
+				return nil, fmt.Errorf("gccgo importer requires lookup to return an io.ReadSeeker, have %T", rc)
+			}
+			reader = rs
+			fpath = "<lookup " + pkgpath + ">"
+			// Take name from Name method (like on os.File) if present.
+			if n, ok := rc.(interface{ Name() string }); ok {
+				fpath = n.Name()
+			}
+		} else {
+			fpath, err = findExportFile(searchpaths, pkgpath)
+			if err != nil {
+				return nil, err
+			}
 
-		reader, closer, err := openExportFile(fpath)
-		if err != nil {
-			return
-		}
-		if closer != nil {
-			defer closer.Close()
+			r, closer, err := openExportFile(fpath)
+			if err != nil {
+				return nil, err
+			}
+			if closer != nil {
+				defer closer.Close()
+			}
+			reader = r
 		}
 
 		var magic [4]byte
@@ -168,7 +197,7 @@ func GetImporter(searchpaths []string, initmap map[*types.Package]InitData) Impo
 		}
 
 		switch string(magic[:]) {
-		case gccgov1Magic:
+		case gccgov1Magic, gccgov2Magic:
 			var p parser
 			p.init(fpath, reader, imports)
 			pkg = p.parsePackage()

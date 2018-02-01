@@ -11,8 +11,12 @@ var _ unsafe.Pointer
 
 // Do the interface allocations only once for common
 // Errno values.
+const (
+	errnoERROR_IO_PENDING = 997
+)
+
 var (
-	errERROR_IO_PENDING error = Errno(ERROR_IO_PENDING)
+	errERROR_IO_PENDING error = Errno(errnoERROR_IO_PENDING)
 )
 
 // errnoErr returns common boxed Errno values, to prevent
@@ -21,7 +25,7 @@ func errnoErr(e Errno) error {
 	switch e {
 	case 0:
 		return nil
-	case ERROR_IO_PENDING:
+	case errnoERROR_IO_PENDING:
 		return errERROR_IO_PENDING
 	}
 	// TODO: add more here, after collecting data on the common
@@ -76,6 +80,7 @@ var (
 	procCancelIo                           = modkernel32.NewProc("CancelIo")
 	procCancelIoEx                         = modkernel32.NewProc("CancelIoEx")
 	procCreateProcessW                     = modkernel32.NewProc("CreateProcessW")
+	procCreateProcessAsUserW               = modadvapi32.NewProc("CreateProcessAsUserW")
 	procOpenProcess                        = modkernel32.NewProc("OpenProcess")
 	procTerminateProcess                   = modkernel32.NewProc("TerminateProcess")
 	procGetExitCodeProcess                 = modkernel32.NewProc("GetExitCodeProcess")
@@ -602,6 +607,24 @@ func CreateProcess(appName *uint16, commandLine *uint16, procSecurity *SecurityA
 		_p0 = 0
 	}
 	r1, _, e1 := Syscall12(procCreateProcessW.Addr(), 10, uintptr(unsafe.Pointer(appName)), uintptr(unsafe.Pointer(commandLine)), uintptr(unsafe.Pointer(procSecurity)), uintptr(unsafe.Pointer(threadSecurity)), uintptr(_p0), uintptr(creationFlags), uintptr(unsafe.Pointer(env)), uintptr(unsafe.Pointer(currentDir)), uintptr(unsafe.Pointer(startupInfo)), uintptr(unsafe.Pointer(outProcInfo)), 0, 0)
+	if r1 == 0 {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		} else {
+			err = EINVAL
+		}
+	}
+	return
+}
+
+func CreateProcessAsUser(token Token, appName *uint16, commandLine *uint16, procSecurity *SecurityAttributes, threadSecurity *SecurityAttributes, inheritHandles bool, creationFlags uint32, env *uint16, currentDir *uint16, startupInfo *StartupInfo, outProcInfo *ProcessInformation) (err error) {
+	var _p0 uint32
+	if inheritHandles {
+		_p0 = 1
+	} else {
+		_p0 = 0
+	}
+	r1, _, e1 := Syscall12(procCreateProcessAsUserW.Addr(), 11, uintptr(token), uintptr(unsafe.Pointer(appName)), uintptr(unsafe.Pointer(commandLine)), uintptr(unsafe.Pointer(procSecurity)), uintptr(unsafe.Pointer(threadSecurity)), uintptr(_p0), uintptr(creationFlags), uintptr(unsafe.Pointer(env)), uintptr(unsafe.Pointer(currentDir)), uintptr(unsafe.Pointer(startupInfo)), uintptr(unsafe.Pointer(outProcInfo)), 0)
 	if r1 == 0 {
 		if e1 != 0 {
 			err = errnoErr(e1)

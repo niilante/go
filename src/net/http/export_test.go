@@ -8,23 +8,29 @@
 package http
 
 import (
+	"context"
 	"net"
 	"sort"
 	"sync"
+	"testing"
 	"time"
 )
 
 var (
-	DefaultUserAgent             = defaultUserAgent
-	NewLoggingConn               = newLoggingConn
-	ExportAppendTime             = appendTime
-	ExportRefererForURL          = refererForURL
-	ExportServerNewConn          = (*Server).newConn
-	ExportCloseWriteAndWait      = (*conn).closeWriteAndWait
-	ExportErrRequestCanceled     = errRequestCanceled
-	ExportErrRequestCanceledConn = errRequestCanceledConn
-	ExportServeFile              = serveFile
-	ExportHttp2ConfigureServer   = http2ConfigureServer
+	DefaultUserAgent                  = defaultUserAgent
+	NewLoggingConn                    = newLoggingConn
+	ExportAppendTime                  = appendTime
+	ExportRefererForURL               = refererForURL
+	ExportServerNewConn               = (*Server).newConn
+	ExportCloseWriteAndWait           = (*conn).closeWriteAndWait
+	ExportErrRequestCanceled          = errRequestCanceled
+	ExportErrRequestCanceledConn      = errRequestCanceledConn
+	ExportErrServerClosedIdle         = errServerClosedIdle
+	ExportServeFile                   = serveFile
+	ExportScanETag                    = scanETag
+	ExportHttp2ConfigureServer        = http2ConfigureServer
+	Export_shouldCopyHeaderOnRedirect = shouldCopyHeaderOnRedirect
+	Export_writeStatusLine            = writeStatusLine
 )
 
 func init() {
@@ -57,9 +63,14 @@ func SetPendingDialHooks(before, after func()) {
 func SetTestHookServerServe(fn func(*Server, net.Listener)) { testHookServerServe = fn }
 
 func NewTestTimeoutHandler(handler Handler, ch <-chan time.Time) Handler {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-ch
+		cancel()
+	}()
 	return &timeoutHandler{
 		handler:     handler,
-		testTimeout: ch,
+		testContext: ctx,
 		// (no body)
 	}
 }
@@ -85,6 +96,12 @@ func (t *Transport) IdleConnKeysForTesting() (keys []string) {
 	}
 	sort.Strings(keys)
 	return
+}
+
+func (t *Transport) IdleConnKeyCountForTesting() int {
+	t.idleMu.Lock()
+	defer t.idleMu.Unlock()
+	return len(t.idleConn)
 }
 
 func (t *Transport) IdleConnStrsForTesting() []string {
@@ -179,4 +196,24 @@ func ExportHttp2ConfigureTransport(t *Transport) error {
 	return nil
 }
 
-var Export_shouldCopyHeaderOnRedirect = shouldCopyHeaderOnRedirect
+func (s *Server) ExportAllConnsIdle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for c := range s.activeConn {
+		st, ok := c.curState.Load().(ConnState)
+		if !ok || st != StateIdle {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Request) WithT(t *testing.T) *Request {
+	return r.WithContext(context.WithValue(r.Context(), tLogKey{}, t.Logf))
+}
+
+func ExportSetH2GoawayTimeout(d time.Duration) (restore func()) {
+	old := http2goAwayTimeout
+	http2goAwayTimeout = d
+	return func() { http2goAwayTimeout = old }
+}

@@ -36,7 +36,7 @@ Flags:
 	-T address
 		Set text segment address.
 	-V
-		Print the linker version and exit.
+		Print linker version and exit.
 	-X importpath.name=value
 		Set the value of the string variable in importpath named name to value.
 		Note that before Go 1.5 this option took two separate arguments.
@@ -85,6 +85,8 @@ Flags:
 		Link with C/C++ memory sanitizer support.
 	-o file
 		Write output to file (default a.out, or a.out.exe on Windows).
+	-pluginpath path
+		The path name used to prefix exported plugin symbols.
 	-r dir1:dir2:...
 		Set the ELF dynamic linker search path.
 	-race

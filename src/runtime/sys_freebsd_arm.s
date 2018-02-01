@@ -39,8 +39,9 @@
 #define SYS_thr_kill (SYS_BASE + 433)
 #define SYS__umtx_op (SYS_BASE + 454)
 #define SYS_thr_new (SYS_BASE + 455)
-#define SYS_mmap (SYS_BASE + 477) 
-	
+#define SYS_mmap (SYS_BASE + 477)
+#define SYS_cpuset_getaffinity (SYS_BASE + 487)
+
 TEXT runtime·sys_umtx_op(SB),NOSPLIT,$0
 	MOVW addr+0(FP), R0
 	MOVW mode+4(FP), R1
@@ -81,13 +82,22 @@ TEXT runtime·exit(SB),NOSPLIT,$-8
 	MOVW.CS R8, (R8)
 	RET
 
-TEXT runtime·exit1(SB),NOSPLIT,$-8
-	MOVW code+0(FP), R0	// arg 1 exit status
-	MOVW $SYS_thr_exit, R7	
-	SWI $0
-	MOVW.CS $0, R8 // crash on syscall failure
-	MOVW.CS R8, (R8)
-	RET
+// func exitThread(wait *uint32)
+TEXT runtime·exitThread(SB),NOSPLIT,$0-4
+	MOVW	wait+0(FP), R0
+	// We're done using the stack.
+	MOVW	$0, R2
+storeloop:
+	LDREX	(R0), R4          // loads R4
+	STREX	R2, (R0), R1      // stores R2
+	CMP	$0, R1
+	BNE	storeloop
+	MOVW	$0, R0		// arg 1 long *state
+	MOVW	$SYS_thr_exit, R7
+	SWI	$0
+	MOVW.CS	$0, R8 // crash on syscall failure
+	MOVW.CS	R8, (R8)
+	JMP	0(PC)
 
 TEXT runtime·open(SB),NOSPLIT,$-8
 	MOVW name+0(FP), R0	// arg 1 name
@@ -166,8 +176,8 @@ TEXT runtime·setitimer(SB), NOSPLIT, $-8
 	SWI $0
 	RET
 
-// func now() (sec int64, nsec int32)
-TEXT time·now(SB), NOSPLIT, $32
+// func walltime() (sec int64, nsec int32)
+TEXT runtime·walltime(SB), NOSPLIT, $32
 	MOVW $0, R0 // CLOCK_REALTIME
 	MOVW $8(R13), R1
 	MOVW $SYS_clock_gettime, R7
@@ -248,8 +258,11 @@ TEXT runtime·mmap(SB),NOSPLIT,$16
 	MOVW $SYS_mmap, R7
 	SWI $0
 	SUB $4, R13
-	// TODO(dfc) error checking ?
-	MOVW	R0, ret+24(FP)
+	MOVW $0, R1
+	MOVW.CS R0, R1		// if failed, put in R1
+	MOVW.CS $0, R0
+	MOVW	R0, p+24(FP)
+	MOVW	R1, err+28(FP)
 	RET
 
 TEXT runtime·munmap(SB),NOSPLIT,$0
@@ -375,4 +388,18 @@ TEXT ·publicationBarrier(SB),NOSPLIT,$-4-0
 // TODO(minux): this only supports ARMv6K+.
 TEXT runtime·read_tls_fallback(SB),NOSPLIT,$-4
 	WORD $0xee1d0f70 // mrc p15, 0, r0, c13, c0, 3
+	RET
+
+// func cpuset_getaffinity(level int, which int, id int64, size int, mask *byte) int32
+TEXT runtime·cpuset_getaffinity(SB), NOSPLIT, $0-28
+	MOVW	level+0(FP), R0
+	MOVW	which+4(FP), R1
+	MOVW	id_lo+8(FP), R2
+	MOVW	id_hi+12(FP), R3
+	ADD	$20, R13	// Pass size and mask on stack.
+	MOVW	$SYS_cpuset_getaffinity, R7
+	SWI	$0
+	RSB.CS	$0, R0
+	SUB	$20, R13
+	MOVW	R0, ret+24(FP)
 	RET

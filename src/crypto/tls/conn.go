@@ -37,7 +37,7 @@ type Conn struct {
 	vers          uint16  // TLS version
 	haveVers      bool    // version has been negotiated
 	config        *Config // configuration passed to constructor
-	// handshakeComplete is true if the connection is currently transfering
+	// handshakeComplete is true if the connection is currently transferring
 	// application data (i.e. is not currently processing a handshake).
 	handshakeComplete bool
 	// handshakes counts the number of handshakes performed on the
@@ -64,6 +64,13 @@ type Conn struct {
 	// the first transmitted Finished message is the tls-unique
 	// channel-binding value.
 	clientFinishedIsFirst bool
+
+	// closeNotifyErr is any error from sending the alertCloseNotify record.
+	closeNotifyErr error
+	// closeNotifySent is true if the Conn attempted to send an
+	// alertCloseNotify record.
+	closeNotifySent bool
+
 	// clientFinished and serverFinished contain the Finished message sent
 	// by the client or server in the most recent handshake. This is
 	// retained to support the renegotiation extension and tls-unique
@@ -86,6 +93,10 @@ type Conn struct {
 	// packetsSent counts packets.
 	bytesSent   int64
 	packetsSent int64
+
+	// warnCount counts the number of consecutive warning alerts received
+	// by Conn.readRecord. Protected by in.Mutex.
+	warnCount int
 
 	// activeCall is an atomic int32; the low bit is whether Close has
 	// been called. the rest of the bits are the number of goroutines
@@ -206,10 +217,11 @@ func extractPadding(payload []byte) (toRemove int, good byte) {
 	// if len(payload) >= (paddingLen - 1) then the MSB of t is zero
 	good = byte(int32(^t) >> 31)
 
-	toCheck := 255 // the maximum possible padding length
+	// The maximum possible padding length plus the actual length field
+	toCheck := 256
 	// The length of the padded data is public, so we can use an if here
-	if toCheck+1 > len(payload) {
-		toCheck = len(payload) - 1
+	if toCheck > len(payload) {
+		toCheck = len(payload)
 	}
 
 	for i := 0; i < toCheck; i++ {
@@ -278,13 +290,17 @@ func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, alertValue alert)
 		switch c := hc.cipher.(type) {
 		case cipher.Stream:
 			c.XORKeyStream(payload, payload)
-		case cipher.AEAD:
-			explicitIVLen = 8
+		case aead:
+			explicitIVLen = c.explicitNonceLen()
 			if len(payload) < explicitIVLen {
 				return false, 0, alertBadRecordMAC
 			}
-			nonce := payload[:8]
-			payload = payload[8:]
+			nonce := payload[:explicitIVLen]
+			payload = payload[explicitIVLen:]
+
+			if len(nonce) == 0 {
+				nonce = hc.seq[:]
+			}
 
 			copy(hc.additionalData[:], hc.seq[:])
 			copy(hc.additionalData[8:], b.data[:3])
@@ -391,10 +407,13 @@ func (hc *halfConn) encrypt(b *block, explicitIVLen int) (bool, alert) {
 		switch c := hc.cipher.(type) {
 		case cipher.Stream:
 			c.XORKeyStream(payload, payload)
-		case cipher.AEAD:
+		case aead:
 			payloadLen := len(b.data) - recordHeaderLen - explicitIVLen
 			b.resize(len(b.data) + c.Overhead())
 			nonce := b.data[recordHeaderLen : recordHeaderLen+explicitIVLen]
+			if len(nonce) == 0 {
+				nonce = hc.seq[:]
+			}
 			payload := b.data[recordHeaderLen+explicitIVLen:]
 			payload = payload[:payloadLen]
 
@@ -643,6 +662,11 @@ Again:
 		return c.in.setErrorLocked(err)
 	}
 
+	if typ != recordTypeAlert && len(data) > 0 {
+		// this is a valid non-alert message: reset the count of alerts
+		c.warnCount = 0
+	}
+
 	switch typ {
 	default:
 		c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
@@ -660,6 +684,13 @@ Again:
 		case alertLevelWarning:
 			// drop on the floor
 			c.in.freeBlock(b)
+
+			c.warnCount++
+			if c.warnCount > maxWarnAlertCount {
+				c.sendAlert(alertUnexpectedMessage)
+				return c.in.setErrorLocked(errors.New("tls: too many warn alerts"))
+			}
+
 			goto Again
 		case alertLevelError:
 			c.in.setErrorLocked(&net.OpError{Op: "remote error", Err: alert(data[1])})
@@ -669,6 +700,11 @@ Again:
 
 	case recordTypeChangeCipherSpec:
 		if typ != want || len(data) != 1 || data[0] != 1 {
+			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+			break
+		}
+		// Handshake messages are not allowed to fragment across the CCS
+		if c.hand.Len() > 0 {
 			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 			break
 		}
@@ -852,15 +888,16 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 			}
 		}
 		if explicitIVLen == 0 {
-			if _, ok := c.out.cipher.(cipher.AEAD); ok {
-				explicitIVLen = 8
+			if c, ok := c.out.cipher.(aead); ok {
+				explicitIVLen = c.explicitNonceLen()
+
 				// The AES-GCM construction in TLS has an
 				// explicit nonce so that the nonce can be
 				// random. However, the nonce is only 8 bytes
 				// which is too small for a secure, random
 				// nonce. Therefore we use the sequence number
 				// as the nonce.
-				explicitIVIsSeq = true
+				explicitIVIsSeq = explicitIVLen > 0
 			}
 		}
 		m := len(data)
@@ -981,7 +1018,7 @@ func (c *Conn) readHandshake() (interface{}, error) {
 		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
 
-	// The handshake message unmarshallers
+	// The handshake message unmarshalers
 	// expect to be able to keep references to data,
 	// so pass in a fresh copy that won't be overwritten.
 	data = append([]byte(nil), data...)
@@ -992,7 +1029,10 @@ func (c *Conn) readHandshake() (interface{}, error) {
 	return m, nil
 }
 
-var errClosed = errors.New("tls: use of closed connection")
+var (
+	errClosed   = errors.New("tls: use of closed connection")
+	errShutdown = errors.New("tls: protocol is shutdown")
+)
 
 // Write writes data to the connection.
 func (c *Conn) Write(b []byte) (int, error) {
@@ -1021,6 +1061,10 @@ func (c *Conn) Write(b []byte) (int, error) {
 
 	if !c.handshakeComplete {
 		return 0, alertInternalError
+	}
+
+	if c.closeNotifySent {
+		return 0, errShutdown
 	}
 
 	// SSL 3.0 and TLS 1.0 are susceptible to a chosen-plaintext
@@ -1184,15 +1228,41 @@ func (c *Conn) Close() error {
 	var alertErr error
 
 	c.handshakeMutex.Lock()
-	defer c.handshakeMutex.Unlock()
 	if c.handshakeComplete {
-		alertErr = c.sendAlert(alertCloseNotify)
+		alertErr = c.closeNotify()
 	}
+	c.handshakeMutex.Unlock()
 
 	if err := c.conn.Close(); err != nil {
 		return err
 	}
 	return alertErr
+}
+
+var errEarlyCloseWrite = errors.New("tls: CloseWrite called before handshake complete")
+
+// CloseWrite shuts down the writing side of the connection. It should only be
+// called once the handshake has completed and does not call CloseWrite on the
+// underlying connection. Most callers should just use Close.
+func (c *Conn) CloseWrite() error {
+	c.handshakeMutex.Lock()
+	defer c.handshakeMutex.Unlock()
+	if !c.handshakeComplete {
+		return errEarlyCloseWrite
+	}
+
+	return c.closeNotify()
+}
+
+func (c *Conn) closeNotify() error {
+	c.out.Lock()
+	defer c.out.Unlock()
+
+	if !c.closeNotifySent {
+		c.closeNotifyErr = c.sendAlertLocked(alertCloseNotify)
+		c.closeNotifySent = true
+	}
+	return c.closeNotifyErr
 }
 
 // Handshake runs the client or server handshake

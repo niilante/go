@@ -66,14 +66,21 @@ func direntNamlen(buf []byte) (uint64, bool) {
 	return readInt(buf, unsafe.Offsetof(Dirent{}.Namlen), unsafe.Sizeof(Dirent{}.Namlen))
 }
 
-//sysnb pipe() (r int, w int, err error)
+func Pipe(p []int) error {
+	return Pipe2(p, 0)
+}
 
-func Pipe(p []int) (err error) {
+//sysnb pipe2(p *[2]_C_int, flags int) (err error)
+
+func Pipe2(p []int, flags int) error {
 	if len(p) != 2 {
 		return EINVAL
 	}
-	p[0], p[1], err = pipe()
-	return
+	var pp [2]_C_int
+	err := pipe2(&pp, flags)
+	p[0] = int(pp[0])
+	p[1] = int(pp[1])
+	return err
 }
 
 func GetsockoptIPMreqn(fd, level, opt int) (*IPMreqn, error) {
@@ -113,12 +120,16 @@ func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
 		bufsize = unsafe.Sizeof(Statfs_t{}) * uintptr(len(buf))
 	}
 	r0, _, e1 := Syscall(SYS_GETFSSTAT, uintptr(_p0), bufsize, uintptr(flags))
-	use(unsafe.Pointer(_p0))
 	n = int(r0)
 	if e1 != 0 {
 		err = e1
 	}
 	return
+}
+
+func setattrlistTimes(path string, times []Timespec) error {
+	// used on Darwin for UtimesNano
+	return ENOSYS
 }
 
 /*
@@ -134,7 +145,6 @@ func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
 //sys	Close(fd int) (err error)
 //sys	Dup(fd int) (nfd int, err error)
 //sys	Dup2(from int, to int) (err error)
-//sys	Exit(code int)
 //sys	Fchdir(fd int) (err error)
 //sys	Fchflags(fd int, flags int) (err error)
 //sys	Fchmod(fd int, mode uint32) (err error)
@@ -209,6 +219,7 @@ func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
 //sys	readlen(fd int, buf *byte, nbuf int) (n int, err error) = SYS_READ
 //sys	writelen(fd int, buf *byte, nbuf int) (n int, err error) = SYS_WRITE
 //sys	accept4(fd int, rsa *RawSockaddrAny, addrlen *_Socklen, flags int) (nfd int, err error)
+//sys	utimensat(dirfd int, path string, times *[2]Timespec, flag int) (err error)
 
 /*
  * Unimplemented

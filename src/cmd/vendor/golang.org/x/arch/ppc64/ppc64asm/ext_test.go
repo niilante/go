@@ -35,7 +35,7 @@ var (
 	debug      = false
 )
 
-// A ExtInst represents a single decoded instruction parsed
+// An ExtInst represents a single decoded instruction parsed
 // from an external disassembler's output.
 type ExtInst struct {
 	addr uint32
@@ -176,7 +176,7 @@ func testExtDis(
 	t.Logf("%d test cases, %d expected mismatches, %d failures; %.0f cases/second", totalTests, totalSkips, totalErrors, float64(totalTests)/time.Since(start).Seconds())
 
 	if err := <-errc; err != nil {
-		t.Fatal("external disassembler: %v", err)
+		t.Fatalf("external disassembler: %v", err)
 	}
 
 }

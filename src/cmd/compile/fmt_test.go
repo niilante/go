@@ -211,6 +211,28 @@ func TestFormats(t *testing.T) {
 		fmt.Println("}")
 	}
 
+	// check that knownFormats is up to date
+	if !testing.Verbose() && !*update {
+		var mismatch bool
+		for s := range foundFormats {
+			if _, ok := knownFormats[s]; !ok {
+				mismatch = true
+				break
+			}
+		}
+		if !mismatch {
+			for s := range knownFormats {
+				if _, ok := foundFormats[s]; !ok {
+					mismatch = true
+					break
+				}
+			}
+		}
+		if mismatch {
+			t.Errorf("knownFormats is out of date; please 'go test -v fmt_test.go > foo', then extract new definition of knownFormats from foo")
+		}
+	}
+
 	// all format strings of calls must be in the formatStrings set (self-verification)
 	for _, p := range callSites {
 		if lit, ok := p.arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
@@ -397,7 +419,7 @@ func stringVal(tv types.TypeAndValue) (string, bool) {
 // formatIter iterates through the string s in increasing
 // index order and calls f for each format specifier '%..v'.
 // The arguments for f describe the specifier's index range.
-// If a format specifier contains a  "*", f is called with
+// If a format specifier contains a "*", f is called with
 // the index range for "*" alone, before being called for
 // the entire specifier. The result of f is the index of
 // the rune at which iteration continues.
@@ -506,9 +528,7 @@ func formatReplace(in string, f func(i int, s string) string) string {
 
 // blacklistedPackages is the set of packages which can
 // be ignored.
-var blacklistedPackages = map[string]bool{
-	"cmd/compile/internal/big": true,
-}
+var blacklistedPackages = map[string]bool{}
 
 // blacklistedFunctions is the set of functions which may have
 // format-like arguments but which don't do any formatting and
@@ -537,10 +557,6 @@ func init() {
 // To print out a new table, run: go test -run Formats -v.
 var knownFormats = map[string]string{
 	"*bytes.Buffer %s":                                "",
-	"*cmd/compile/internal/big.Int %#x":               "",
-	"*cmd/compile/internal/gc.Bits %v":                "",
-	"*cmd/compile/internal/gc.Field %p":               "",
-	"*cmd/compile/internal/gc.Field %v":               "",
 	"*cmd/compile/internal/gc.Mpflt %v":               "",
 	"*cmd/compile/internal/gc.Mpint %v":               "",
 	"*cmd/compile/internal/gc.Node %#v":               "",
@@ -552,118 +568,125 @@ var knownFormats = map[string]string{
 	"*cmd/compile/internal/gc.Node %j":                "",
 	"*cmd/compile/internal/gc.Node %p":                "",
 	"*cmd/compile/internal/gc.Node %v":                "",
-	"*cmd/compile/internal/gc.Sym %+v":                "",
-	"*cmd/compile/internal/gc.Sym %-v":                "",
-	"*cmd/compile/internal/gc.Sym %0S":                "",
-	"*cmd/compile/internal/gc.Sym %S":                 "",
-	"*cmd/compile/internal/gc.Sym %p":                 "",
-	"*cmd/compile/internal/gc.Sym %v":                 "",
-	"*cmd/compile/internal/gc.Type %#v":               "",
-	"*cmd/compile/internal/gc.Type %+v":               "",
-	"*cmd/compile/internal/gc.Type %-S":               "",
-	"*cmd/compile/internal/gc.Type %0S":               "",
-	"*cmd/compile/internal/gc.Type %L":                "",
-	"*cmd/compile/internal/gc.Type %S":                "",
-	"*cmd/compile/internal/gc.Type %p":                "",
-	"*cmd/compile/internal/gc.Type %v":                "",
 	"*cmd/compile/internal/ssa.Block %s":              "",
 	"*cmd/compile/internal/ssa.Block %v":              "",
 	"*cmd/compile/internal/ssa.Func %s":               "",
+	"*cmd/compile/internal/ssa.Func %v":               "",
+	"*cmd/compile/internal/ssa.LocalSlot %+v":         "",
+	"*cmd/compile/internal/ssa.LocalSlot %v":          "",
+	"*cmd/compile/internal/ssa.Register %s":           "",
 	"*cmd/compile/internal/ssa.SparseTreeNode %v":     "",
 	"*cmd/compile/internal/ssa.Value %s":              "",
 	"*cmd/compile/internal/ssa.Value %v":              "",
+	"*cmd/compile/internal/ssa.VarLoc %v":             "",
 	"*cmd/compile/internal/ssa.sparseTreeMapEntry %v": "",
+	"*cmd/compile/internal/types.Field %p":            "",
+	"*cmd/compile/internal/types.Field %v":            "",
+	"*cmd/compile/internal/types.Sym %+v":             "",
+	"*cmd/compile/internal/types.Sym %-v":             "",
+	"*cmd/compile/internal/types.Sym %0S":             "",
+	"*cmd/compile/internal/types.Sym %S":              "",
+	"*cmd/compile/internal/types.Sym %p":              "",
+	"*cmd/compile/internal/types.Sym %v":              "",
+	"*cmd/compile/internal/types.Type %#v":            "",
+	"*cmd/compile/internal/types.Type %+v":            "",
+	"*cmd/compile/internal/types.Type %-S":            "",
+	"*cmd/compile/internal/types.Type %0S":            "",
+	"*cmd/compile/internal/types.Type %L":             "",
+	"*cmd/compile/internal/types.Type %S":             "",
+	"*cmd/compile/internal/types.Type %p":             "",
+	"*cmd/compile/internal/types.Type %s":             "",
+	"*cmd/compile/internal/types.Type %v":             "",
+	"*cmd/internal/dwarf.Location %#v":                "",
 	"*cmd/internal/obj.Addr %v":                       "",
-	"*cmd/internal/obj.Prog %p":                       "",
-	"*cmd/internal/obj.Prog %s":                       "",
-	"*cmd/internal/obj.Prog %v":                       "",
+	"*cmd/internal/obj.LSym %v":                       "",
+	"*math/big.Int %#x":                               "",
+	"*math/big.Int %s":                                "",
 	"[16]byte %x":                                     "",
 	"[]*cmd/compile/internal/gc.Node %v":              "",
 	"[]*cmd/compile/internal/gc.Sig %#v":              "",
 	"[]*cmd/compile/internal/ssa.Value %v":            "",
+	"[][]cmd/compile/internal/ssa.SlotID %v":          "",
 	"[]byte %s":                                       "",
 	"[]byte %x":                                       "",
 	"[]cmd/compile/internal/ssa.Edge %v":              "",
 	"[]cmd/compile/internal/ssa.ID %v":                "",
+	"[]cmd/compile/internal/ssa.VarLocList %v":        "",
+	"[]cmd/compile/internal/syntax.token %s":          "",
 	"[]string %v":                                     "",
-	"bool %t":                                         "",
 	"bool %v":                                         "",
-	"byte %02x":                                       "",
 	"byte %08b":                                       "",
 	"byte %c":                                         "",
 	"cmd/compile/internal/arm.shift %d":               "",
 	"cmd/compile/internal/gc.Class %d":                "",
+	"cmd/compile/internal/gc.Class %s":                "",
+	"cmd/compile/internal/gc.Class %v":                "",
 	"cmd/compile/internal/gc.Ctype %d":                "",
 	"cmd/compile/internal/gc.Ctype %v":                "",
-	"cmd/compile/internal/gc.EType %d":                "",
-	"cmd/compile/internal/gc.EType %s":                "",
-	"cmd/compile/internal/gc.EType %v":                "",
 	"cmd/compile/internal/gc.Level %d":                "",
 	"cmd/compile/internal/gc.Level %v":                "",
-	"cmd/compile/internal/gc.Node %#v":                "",
 	"cmd/compile/internal/gc.Nodes %#v":               "",
 	"cmd/compile/internal/gc.Nodes %+v":               "",
 	"cmd/compile/internal/gc.Nodes %.v":               "",
 	"cmd/compile/internal/gc.Nodes %v":                "",
 	"cmd/compile/internal/gc.Op %#v":                  "",
+	"cmd/compile/internal/gc.Op %d":                   "",
 	"cmd/compile/internal/gc.Op %v":                   "",
 	"cmd/compile/internal/gc.Val %#v":                 "",
 	"cmd/compile/internal/gc.Val %T":                  "",
 	"cmd/compile/internal/gc.Val %v":                  "",
+	"cmd/compile/internal/gc.fmtMode %d":              "",
 	"cmd/compile/internal/gc.initKind %d":             "",
-	"cmd/compile/internal/ssa.BlockKind %s":           "",
+	"cmd/compile/internal/gc.locID %v":                "",
 	"cmd/compile/internal/ssa.BranchPrediction %d":    "",
 	"cmd/compile/internal/ssa.Edge %v":                "",
-	"cmd/compile/internal/ssa.GCNode %s":              "",
+	"cmd/compile/internal/ssa.GCNode %v":              "",
 	"cmd/compile/internal/ssa.ID %d":                  "",
+	"cmd/compile/internal/ssa.ID %v":                  "",
 	"cmd/compile/internal/ssa.LocalSlot %s":           "",
-	"cmd/compile/internal/ssa.Location %v":            "",
+	"cmd/compile/internal/ssa.Location %s":            "",
 	"cmd/compile/internal/ssa.Op %s":                  "",
 	"cmd/compile/internal/ssa.Op %v":                  "",
-	"cmd/compile/internal/ssa.SizeAndAlign %s":        "",
-	"cmd/compile/internal/ssa.Type %s":                "",
 	"cmd/compile/internal/ssa.ValAndOff %s":           "",
-	"cmd/compile/internal/ssa.markKind %d":            "",
+	"cmd/compile/internal/ssa.VarLocList %v":          "",
 	"cmd/compile/internal/ssa.rbrank %d":              "",
 	"cmd/compile/internal/ssa.regMask %d":             "",
 	"cmd/compile/internal/ssa.register %d":            "",
 	"cmd/compile/internal/syntax.Expr %#v":            "",
-	"cmd/compile/internal/syntax.Expr %s":             "",
 	"cmd/compile/internal/syntax.Node %T":             "",
 	"cmd/compile/internal/syntax.Operator %d":         "",
 	"cmd/compile/internal/syntax.Operator %s":         "",
 	"cmd/compile/internal/syntax.token %d":            "",
 	"cmd/compile/internal/syntax.token %q":            "",
 	"cmd/compile/internal/syntax.token %s":            "",
-	"cmd/internal/obj.As %v":                          "",
+	"cmd/compile/internal/types.EType %d":             "",
+	"cmd/compile/internal/types.EType %s":             "",
+	"cmd/compile/internal/types.EType %v":             "",
+	"cmd/internal/dwarf.Location %#v":                 "",
+	"cmd/internal/src.Pos %s":                         "",
+	"cmd/internal/src.Pos %v":                         "",
 	"error %v":                                        "",
 	"float64 %.2f":                                    "",
 	"float64 %.3f":                                    "",
 	"float64 %.6g":                                    "",
 	"float64 %g":                                      "",
-	"fmt.Stringer %T":                                 "",
-	"int %#x":                                         "",
 	"int %-12d":                                       "",
-	"int %-2d":                                        "",
 	"int %-6d":                                        "",
 	"int %-8o":                                        "",
-	"int %2d":                                         "",
-	"int %5d":                                         "",
+	"int %02d":                                        "",
 	"int %6d":                                         "",
 	"int %c":                                          "",
 	"int %d":                                          "",
 	"int %v":                                          "",
 	"int %x":                                          "",
-	"int16 %2d":                                       "",
 	"int16 %d":                                        "",
 	"int16 %x":                                        "",
-	"int32 %4d":                                       "",
-	"int32 %5d":                                       "",
 	"int32 %d":                                        "",
 	"int32 %v":                                        "",
 	"int32 %x":                                        "",
 	"int64 %+d":                                       "",
 	"int64 %-10d":                                     "",
+	"int64 %.5d":                                      "",
 	"int64 %X":                                        "",
 	"int64 %d":                                        "",
 	"int64 %v":                                        "",
@@ -679,27 +702,23 @@ var knownFormats = map[string]string{
 	"reflect.Type %s":  "",
 	"rune %#U":         "",
 	"rune %c":          "",
-	"rune %d":          "",
+	"string %-*s":      "",
 	"string %-16s":     "",
+	"string %-6s":      "",
 	"string %.*s":      "",
 	"string %q":        "",
 	"string %s":        "",
 	"string %v":        "",
 	"time.Duration %d": "",
 	"time.Duration %v": "",
-	"uint %.4d":        "",
 	"uint %04x":        "",
+	"uint %5d":         "",
 	"uint %d":          "",
-	"uint %v":          "",
 	"uint16 %d":        "",
 	"uint16 %v":        "",
 	"uint16 %x":        "",
-	"uint32 %#x":       "",
-	"uint32 %08x":      "",
 	"uint32 %d":        "",
 	"uint32 %x":        "",
-	"uint64 %#x":       "",
-	"uint64 %016x":     "",
 	"uint64 %08x":      "",
 	"uint64 %d":        "",
 	"uint64 %x":        "",

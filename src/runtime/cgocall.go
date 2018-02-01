@@ -8,9 +8,9 @@
 // runtime.cgocall(_cgo_Cfunc_f, frame), where _cgo_Cfunc_f is a
 // gcc-compiled function written by cgo.
 //
-// runtime.cgocall (below) locks g to m, calls entersyscall
-// so as not to block other goroutines or the garbage collector,
-// and then calls runtime.asmcgocall(_cgo_Cfunc_f, frame).
+// runtime.cgocall (below) calls entersyscall so as not to block
+// other goroutines or the garbage collector, and then calls
+// runtime.asmcgocall(_cgo_Cfunc_f, frame).
 //
 // runtime.asmcgocall (in asm_$GOARCH.s) switches to the m->g0 stack
 // (assumed to be an operating system-allocated stack, so safe to run
@@ -104,11 +104,6 @@ func cgocall(fn, arg unsafe.Pointer) int32 {
 		racereleasemerge(unsafe.Pointer(&racecgosync))
 	}
 
-	/*
-	 * Lock g to m to ensure we stay on the same stack if we do a
-	 * cgo callback. In case of panic, unwindm calls endcgo.
-	 */
-	lockOSThread()
 	mp := getg().m
 	mp.ncgocall++
 	mp.ncgo++
@@ -116,34 +111,56 @@ func cgocall(fn, arg unsafe.Pointer) int32 {
 	// Reset traceback.
 	mp.cgoCallers[0] = 0
 
-	/*
-	 * Announce we are entering a system call
-	 * so that the scheduler knows to create another
-	 * M to run goroutines while we are in the
-	 * foreign code.
-	 *
-	 * The call to asmcgocall is guaranteed not to
-	 * split the stack and does not allocate memory,
-	 * so it is safe to call while "in a system call", outside
-	 * the $GOMAXPROCS accounting.
-	 */
+	// Announce we are entering a system call
+	// so that the scheduler knows to create another
+	// M to run goroutines while we are in the
+	// foreign code.
+	//
+	// The call to asmcgocall is guaranteed not to
+	// grow the stack and does not allocate memory,
+	// so it is safe to call while "in a system call", outside
+	// the $GOMAXPROCS accounting.
+	//
+	// fn may call back into Go code, in which case we'll exit the
+	// "system call", run the Go code (which may grow the stack),
+	// and then re-enter the "system call" reusing the PC and SP
+	// saved by entersyscall here.
 	entersyscall(0)
+
+	mp.incgo = true
 	errno := asmcgocall(fn, arg)
+
+	// Call endcgo before exitsyscall because exitsyscall may
+	// reschedule us on to a different M.
+	endcgo(mp)
+
 	exitsyscall(0)
 
-	endcgo(mp)
+	// From the garbage collector's perspective, time can move
+	// backwards in the sequence above. If there's a callback into
+	// Go code, GC will see this function at the call to
+	// asmcgocall. When the Go call later returns to C, the
+	// syscall PC/SP is rolled back and the GC sees this function
+	// back at the call to entersyscall. Normally, fn and arg
+	// would be live at entersyscall and dead at asmcgocall, so if
+	// time moved backwards, GC would see these arguments as dead
+	// and then live. Prevent these undead arguments from crashing
+	// GC by forcing them to stay live across this time warp.
+	KeepAlive(fn)
+	KeepAlive(arg)
+	KeepAlive(mp)
+
 	return errno
 }
 
 //go:nosplit
 func endcgo(mp *m) {
+	mp.incgo = false
 	mp.ncgo--
 
 	if raceenabled {
 		raceacquire(unsafe.Pointer(&racecgosync))
 	}
-
-	unlockOSThread() // invalidates mp
 }
 
 // Call from C back to Go.
@@ -154,6 +171,12 @@ func cgocallbackg(ctxt uintptr) {
 		println("runtime: bad g in cgocallback")
 		exit(2)
 	}
+
+	// The call from C is on gp.m's g0 stack, so we must ensure
+	// that we stay on that M. We have to do this before calling
+	// exitsyscall, since it would otherwise be free to move us to
+	// a different M. The call to unlockOSThread is in unwindm.
+	lockOSThread()
 
 	// Save current syscall parameters, so m.syscall can be
 	// used again if callback decide to make syscall.
@@ -166,9 +189,15 @@ func cgocallbackg(ctxt uintptr) {
 	savedsp := unsafe.Pointer(gp.syscallsp)
 	savedpc := gp.syscallpc
 	exitsyscall(0) // coming out of cgo call
+	gp.m.incgo = false
 
 	cgocallbackg1(ctxt)
 
+	// At this point unlockOSThread has been called.
+	// The following code must not change to a different m.
+	// This is enforced by checking incgo in the schedule function.
+
+	gp.m.incgo = true
 	// going back to cgo call
 	reentersyscall(savedpc, uintptr(savedsp))
 
@@ -272,6 +301,10 @@ func cgocallbackg1(ctxt uintptr) {
 		// On mips64x, stack frame is two words and there's a saved LR between
 		// SP and the stack frame and between the stack frame and the arguments.
 		cb = (*args)(unsafe.Pointer(sp + 4*sys.PtrSize))
+	case "mips", "mipsle":
+		// On mipsx, stack frame is two words and there's a saved LR between
+		// SP and the stack frame and between the stack frame and the arguments.
+		cb = (*args)(unsafe.Pointer(sp + 4*sys.PtrSize))
 	}
 
 	// Invoke callback.
@@ -299,32 +332,35 @@ func cgocallbackg1(ctxt uintptr) {
 }
 
 func unwindm(restore *bool) {
-	if !*restore {
-		return
-	}
-	// Restore sp saved by cgocallback during
-	// unwind of g's stack (see comment at top of file).
-	mp := acquirem()
-	sched := &mp.g0.sched
-	switch GOARCH {
-	default:
-		throw("unwindm not implemented")
-	case "386", "amd64", "arm", "ppc64", "ppc64le", "mips64", "mips64le", "s390x":
-		sched.sp = *(*uintptr)(unsafe.Pointer(sched.sp + sys.MinFrameSize))
-	case "arm64":
-		sched.sp = *(*uintptr)(unsafe.Pointer(sched.sp + 16))
+	if *restore {
+		// Restore sp saved by cgocallback during
+		// unwind of g's stack (see comment at top of file).
+		mp := acquirem()
+		sched := &mp.g0.sched
+		switch GOARCH {
+		default:
+			throw("unwindm not implemented")
+		case "386", "amd64", "arm", "ppc64", "ppc64le", "mips64", "mips64le", "s390x", "mips", "mipsle":
+			sched.sp = *(*uintptr)(unsafe.Pointer(sched.sp + sys.MinFrameSize))
+		case "arm64":
+			sched.sp = *(*uintptr)(unsafe.Pointer(sched.sp + 16))
+		}
+
+		// Call endcgo to do the accounting that cgocall will not have a
+		// chance to do during an unwind.
+		//
+		// In the case where a Go call originates from C, ncgo is 0
+		// and there is no matching cgocall to end.
+		if mp.ncgo > 0 {
+			endcgo(mp)
+		}
+
+		releasem(mp)
 	}
 
-	// Call endcgo to do the accounting that cgocall will not have a
-	// chance to do during an unwind.
-	//
-	// In the case where a a Go call originates from C, ncgo is 0
-	// and there is no matching cgocall to end.
-	if mp.ncgo > 0 {
-		endcgo(mp)
-	}
-
-	releasem(mp)
+	// Undo the call to lockOSThread in cgocallbackg.
+	// We must still stay on the same m.
+	unlockOSThread()
 }
 
 // called from assembly
@@ -370,10 +406,10 @@ var racecgosync uint64 // represents possible synchronization in C code
 // pointers.)
 
 // cgoCheckPointer checks if the argument contains a Go pointer that
-// points to a Go pointer, and panics if it does. It returns the pointer.
-func cgoCheckPointer(ptr interface{}, args ...interface{}) interface{} {
+// points to a Go pointer, and panics if it does.
+func cgoCheckPointer(ptr interface{}, args ...interface{}) {
 	if debug.cgocheck == 0 {
-		return ptr
+		return
 	}
 
 	ep := (*eface)(unsafe.Pointer(&ptr))
@@ -386,7 +422,7 @@ func cgoCheckPointer(ptr interface{}, args ...interface{}) interface{} {
 			p = *(*unsafe.Pointer)(p)
 		}
 		if !cgoIsGoPointer(p) {
-			return ptr
+			return
 		}
 		aep := (*eface)(unsafe.Pointer(&args[0]))
 		switch aep._type.kind & kindMask {
@@ -397,7 +433,7 @@ func cgoCheckPointer(ptr interface{}, args ...interface{}) interface{} {
 			}
 			pt := (*ptrtype)(unsafe.Pointer(t))
 			cgoCheckArg(pt.elem, p, true, false, cgoCheckPointerFail)
-			return ptr
+			return
 		case kindSlice:
 			// Check the slice rather than the pointer.
 			ep = aep
@@ -415,7 +451,6 @@ func cgoCheckPointer(ptr interface{}, args ...interface{}) interface{} {
 	}
 
 	cgoCheckArg(t, ep.data, t.kind&kindDirectIface == 0, top, cgoCheckPointerFail)
-	return ptr
 }
 
 const cgoCheckPointerFail = "cgo argument has Go pointer to Go pointer"
@@ -514,7 +549,7 @@ func cgoCheckArg(t *_type, p unsafe.Pointer, indir, top bool, msg string) {
 			return
 		}
 		for _, f := range st.fields {
-			cgoCheckArg(f.typ, add(p, f.offset), true, top, msg)
+			cgoCheckArg(f.typ, add(p, f.offset()), true, top, msg)
 		}
 	case kindPtr, kindUnsafePointer:
 		if indir {
@@ -559,10 +594,8 @@ func cgoCheckUnknownPointer(p unsafe.Pointer, msg string) (base, i uintptr) {
 				// No more possible pointers.
 				break
 			}
-			if hbits.isPointer() {
-				if cgoIsGoPointer(*(*unsafe.Pointer)(unsafe.Pointer(base + i))) {
-					panic(errorString(msg))
-				}
+			if hbits.isPointer() && cgoIsGoPointer(*(*unsafe.Pointer)(unsafe.Pointer(base + i))) {
+				panic(errorString(msg))
 			}
 			hbits = hbits.next()
 		}
@@ -570,7 +603,7 @@ func cgoCheckUnknownPointer(p unsafe.Pointer, msg string) (base, i uintptr) {
 		return
 	}
 
-	for datap := &firstmoduledata; datap != nil; datap = datap.next {
+	for _, datap := range activeModules() {
 		if cgoInRange(p, datap.data, datap.edata) || cgoInRange(p, datap.bss, datap.ebss) {
 			// We have no way to know the size of the object.
 			// We have to assume that it might contain a pointer.
@@ -597,7 +630,7 @@ func cgoIsGoPointer(p unsafe.Pointer) bool {
 		return true
 	}
 
-	for datap := &firstmoduledata; datap != nil; datap = datap.next {
+	for _, datap := range activeModules() {
 		if cgoInRange(p, datap.data, datap.edata) || cgoInRange(p, datap.bss, datap.ebss) {
 			return true
 		}

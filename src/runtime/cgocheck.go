@@ -16,6 +16,10 @@ const cgoWriteBarrierFail = "Go pointer stored into non-Go memory"
 
 // cgoCheckWriteBarrier is called whenever a pointer is stored into memory.
 // It throws if the program is storing a Go pointer into non-Go memory.
+//
+// This is called from the write barrier, so its entire call tree must
+// be nosplit.
+//
 //go:nosplit
 //go:nowritebarrier
 func cgoCheckWriteBarrier(dst *uintptr, src uintptr) {
@@ -108,7 +112,7 @@ func cgoCheckTypedBlock(typ *_type, src unsafe.Pointer, off, size uintptr) {
 	}
 
 	// The type has a GC program. Try to find GC bits somewhere else.
-	for datap := &firstmoduledata; datap != nil; datap = datap.next {
+	for _, datap := range activeModules() {
 		if cgoInRange(src, datap.data, datap.edata) {
 			doff := uintptr(src) - datap.data
 			cgoCheckBits(add(src, -doff), datap.gcdatamask.bytedata, off+doff, size)
@@ -123,8 +127,8 @@ func cgoCheckTypedBlock(typ *_type, src unsafe.Pointer, off, size uintptr) {
 
 	aoff := uintptr(src) - mheap_.arena_start
 	idx := aoff >> _PageShift
-	s := h_spans[idx]
-	if s.state == _MSpanStack {
+	s := mheap_.spans[idx]
+	if s.state == _MSpanManual {
 		// There are no heap bits for value stored on the stack.
 		// For a channel receive src might be on the stack of some
 		// other goroutine, so we can't unwind the stack even if

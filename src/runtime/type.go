@@ -22,7 +22,7 @@ const (
 	tflagNamed     tflag = 1 << 2
 )
 
-// Needs to be in sync with ../cmd/compile/internal/ld/decodesym.go:/^func.commonsize,
+// Needs to be in sync with ../cmd/link/internal/ld/decodesym.go:/^func.commonsize,
 // ../cmd/compile/internal/gc/reflect.go:/^func.dcommontype and
 // ../reflect/type.go:/^type.rtype.
 type _type struct {
@@ -199,11 +199,11 @@ func (t *_type) nameOff(off nameOff) name {
 	return resolveNameOff(unsafe.Pointer(t), off)
 }
 
-func (t *_type) typeOff(off typeOff) *_type {
+func resolveTypeOff(ptrInModule unsafe.Pointer, off typeOff) *_type {
 	if off == 0 {
 		return nil
 	}
-	base := uintptr(unsafe.Pointer(t))
+	base := uintptr(ptrInModule)
 	var md *moduledata
 	for next := &firstmoduledata; next != nil; next = next.next {
 		if base >= next.types && base < next.etypes {
@@ -233,6 +233,10 @@ func (t *_type) typeOff(off typeOff) *_type {
 		throw("runtime: type offset out of range")
 	}
 	return (*_type)(unsafe.Pointer(res))
+}
+
+func (t *_type) typeOff(off typeOff) *_type {
+	return resolveTypeOff(unsafe.Pointer(t), off)
 }
 
 func (t *_type) textOff(off textOff) unsafe.Pointer {
@@ -386,9 +390,13 @@ type ptrtype struct {
 }
 
 type structfield struct {
-	name   name
-	typ    *_type
-	offset uintptr
+	name       name
+	typ        *_type
+	offsetAnon uintptr
+}
+
+func (f *structfield) offset() uintptr {
+	return f.offsetAnon >> 1
 }
 
 type structtype struct {
@@ -471,9 +479,9 @@ func typelinksinit() {
 	}
 	typehash := make(map[uint32][]*_type, len(firstmoduledata.typelinks))
 
-	prev := &firstmoduledata
-	md := firstmoduledata.next
-	for md != nil {
+	modules := activeModules()
+	prev := modules[0]
+	for _, md := range modules[1:] {
 		// Collect types from the previous module into typehash.
 	collect:
 		for _, tl := range prev.typelinks {
@@ -497,11 +505,14 @@ func typelinksinit() {
 			// If any of this module's typelinks match a type from a
 			// prior module, prefer that prior type by adding the offset
 			// to this module's typemap.
-			md.typemap = make(map[typeOff]*_type, len(md.typelinks))
+			tm := make(map[typeOff]*_type, len(md.typelinks))
+			pinnedTypemaps = append(pinnedTypemaps, tm)
+			md.typemap = tm
 			for _, tl := range md.typelinks {
 				t := (*_type)(unsafe.Pointer(md.types + uintptr(tl)))
 				for _, candidate := range typehash[t.hash] {
-					if typesEqual(t, candidate) {
+					seen := map[_typePair]struct{}{}
+					if typesEqual(t, candidate, seen) {
 						t = candidate
 						break
 					}
@@ -511,8 +522,12 @@ func typelinksinit() {
 		}
 
 		prev = md
-		md = md.next
 	}
+}
+
+type _typePair struct {
+	t1 *_type
+	t2 *_type
 }
 
 // typesEqual reports whether two types are equal.
@@ -527,7 +542,17 @@ func typelinksinit() {
 // back into earlier ones.
 //
 // Only typelinksinit needs this function.
-func typesEqual(t, v *_type) bool {
+func typesEqual(t, v *_type, seen map[_typePair]struct{}) bool {
+	tp := _typePair{t, v}
+	if _, ok := seen[tp]; ok {
+		return true
+	}
+
+	// mark these types as seen, and thus equivalent which prevents an infinite loop if
+	// the two types are identical, but recursively defined and loaded from
+	// different modules
+	seen[tp] = struct{}{}
+
 	if t == v {
 		return true
 	}
@@ -559,11 +584,11 @@ func typesEqual(t, v *_type) bool {
 	case kindArray:
 		at := (*arraytype)(unsafe.Pointer(t))
 		av := (*arraytype)(unsafe.Pointer(v))
-		return typesEqual(at.elem, av.elem) && at.len == av.len
+		return typesEqual(at.elem, av.elem, seen) && at.len == av.len
 	case kindChan:
 		ct := (*chantype)(unsafe.Pointer(t))
 		cv := (*chantype)(unsafe.Pointer(v))
-		return ct.dir == cv.dir && typesEqual(ct.elem, cv.elem)
+		return ct.dir == cv.dir && typesEqual(ct.elem, cv.elem, seen)
 	case kindFunc:
 		ft := (*functype)(unsafe.Pointer(t))
 		fv := (*functype)(unsafe.Pointer(v))
@@ -572,13 +597,13 @@ func typesEqual(t, v *_type) bool {
 		}
 		tin, vin := ft.in(), fv.in()
 		for i := 0; i < len(tin); i++ {
-			if !typesEqual(tin[i], vin[i]) {
+			if !typesEqual(tin[i], vin[i], seen) {
 				return false
 			}
 		}
 		tout, vout := ft.out(), fv.out()
 		for i := 0; i < len(tout); i++ {
-			if !typesEqual(tout[i], vout[i]) {
+			if !typesEqual(tout[i], vout[i], seen) {
 				return false
 			}
 		}
@@ -595,15 +620,19 @@ func typesEqual(t, v *_type) bool {
 		for i := range it.mhdr {
 			tm := &it.mhdr[i]
 			vm := &iv.mhdr[i]
-			tname := it.typ.nameOff(tm.name)
-			vname := iv.typ.nameOff(vm.name)
+			// Note the mhdr array can be relocated from
+			// another module. See #17724.
+			tname := resolveNameOff(unsafe.Pointer(tm), tm.name)
+			vname := resolveNameOff(unsafe.Pointer(vm), vm.name)
 			if tname.name() != vname.name() {
 				return false
 			}
 			if tname.pkgPath() != vname.pkgPath() {
 				return false
 			}
-			if !typesEqual(it.typ.typeOff(tm.ityp), iv.typ.typeOff(vm.ityp)) {
+			tityp := resolveTypeOff(unsafe.Pointer(tm), tm.ityp)
+			vityp := resolveTypeOff(unsafe.Pointer(vm), vm.ityp)
+			if !typesEqual(tityp, vityp, seen) {
 				return false
 			}
 		}
@@ -611,19 +640,22 @@ func typesEqual(t, v *_type) bool {
 	case kindMap:
 		mt := (*maptype)(unsafe.Pointer(t))
 		mv := (*maptype)(unsafe.Pointer(v))
-		return typesEqual(mt.key, mv.key) && typesEqual(mt.elem, mv.elem)
+		return typesEqual(mt.key, mv.key, seen) && typesEqual(mt.elem, mv.elem, seen)
 	case kindPtr:
 		pt := (*ptrtype)(unsafe.Pointer(t))
 		pv := (*ptrtype)(unsafe.Pointer(v))
-		return typesEqual(pt.elem, pv.elem)
+		return typesEqual(pt.elem, pv.elem, seen)
 	case kindSlice:
 		st := (*slicetype)(unsafe.Pointer(t))
 		sv := (*slicetype)(unsafe.Pointer(v))
-		return typesEqual(st.elem, sv.elem)
+		return typesEqual(st.elem, sv.elem, seen)
 	case kindStruct:
 		st := (*structtype)(unsafe.Pointer(t))
 		sv := (*structtype)(unsafe.Pointer(v))
 		if len(st.fields) != len(sv.fields) {
+			return false
+		}
+		if st.pkgPath.name() != sv.pkgPath.name() {
 			return false
 		}
 		for i := range st.fields {
@@ -632,16 +664,13 @@ func typesEqual(t, v *_type) bool {
 			if tf.name.name() != vf.name.name() {
 				return false
 			}
-			if tf.name.pkgPath() != vf.name.pkgPath() {
-				return false
-			}
-			if !typesEqual(tf.typ, vf.typ) {
+			if !typesEqual(tf.typ, vf.typ, seen) {
 				return false
 			}
 			if tf.name.tag() != vf.name.tag() {
 				return false
 			}
-			if tf.offset != vf.offset {
+			if tf.offsetAnon != vf.offsetAnon {
 				return false
 			}
 		}

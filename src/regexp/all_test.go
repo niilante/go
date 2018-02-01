@@ -9,6 +9,7 @@ import (
 	"regexp/syntax"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 var goodRe = []string{
@@ -354,6 +355,7 @@ type MetaTest struct {
 var metaTests = []MetaTest{
 	{``, ``, ``, true},
 	{`foo`, `foo`, `foo`, true},
+	{`日本語+`, `日本語\+`, `日本語`, false},
 	{`foo\.\$`, `foo\\\.\\\$`, `foo.$`, true}, // has meta but no operator
 	{`foo.\$`, `foo\.\\\$`, `foo`, false},     // has escaped operators and real operators
 	{`!@#$%^&*()_+-=[{]}\|,<.>/?~`, `!@#\$%\^&\*\(\)_\+-=\[\{\]\}\\\|,<\.>/\?~`, `!@#`, false},
@@ -817,4 +819,30 @@ func BenchmarkMatchParallelCopied(b *testing.B) {
 			re.Match(x)
 		}
 	})
+}
+
+var sink string
+
+func BenchmarkQuoteMetaAll(b *testing.B) {
+	specials := make([]byte, 0)
+	for i := byte(0); i < utf8.RuneSelf; i++ {
+		if special(i) {
+			specials = append(specials, i)
+		}
+	}
+	s := string(specials)
+	b.SetBytes(int64(len(s)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sink = QuoteMeta(s)
+	}
+}
+
+func BenchmarkQuoteMetaNone(b *testing.B) {
+	s := "abcdefghijklmnopqrstuvwxyz"
+	b.SetBytes(int64(len(s)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sink = QuoteMeta(s)
+	}
 }

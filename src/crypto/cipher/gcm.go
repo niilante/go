@@ -26,7 +26,7 @@ type AEAD interface {
 	// slice. The nonce must be NonceSize() bytes long and unique for all
 	// time, for a given key.
 	//
-	// The plaintext and dst may alias exactly or not at all. To reuse
+	// The plaintext and dst must overlap exactly or not at all. To reuse
 	// plaintext's storage for the encrypted output, use plaintext[:0] as dst.
 	Seal(dst, nonce, plaintext, additionalData []byte) []byte
 
@@ -36,7 +36,7 @@ type AEAD interface {
 	// bytes long and both it and the additional data must match the
 	// value passed to Seal.
 	//
-	// The ciphertext and dst may alias exactly or not at all. To reuse
+	// The ciphertext and dst must overlap exactly or not at all. To reuse
 	// ciphertext's storage for the decrypted output, use ciphertext[:0] as dst.
 	//
 	// Even if the function fails, the contents of dst, up to its capacity,
@@ -74,6 +74,10 @@ type gcm struct {
 
 // NewGCM returns the given 128-bit, block cipher wrapped in Galois Counter Mode
 // with the standard nonce length.
+//
+// In general, the GHASH operation performed by this implementation of GCM is not constant-time.
+// An exception is when the underlying Block was created by aes.NewCipher
+// on systems with hardware support for AES. See the crypto/aes package documentation for details.
 func NewGCM(cipher Block) (AEAD, error) {
 	return NewGCMWithNonceSize(cipher, gcmStandardNonceSize)
 }
@@ -184,7 +188,7 @@ func (g *gcm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
 	if subtle.ConstantTimeCompare(expectedTag[:], tag) != 1 {
 		// The AESNI code decrypts and authenticates concurrently, and
 		// so overwrites dst in the event of a tag mismatch. That
-		// behaviour is mimicked here in order to be consistent across
+		// behavior is mimicked here in order to be consistent across
 		// platforms.
 		for i := range out {
 			out[i] = 0

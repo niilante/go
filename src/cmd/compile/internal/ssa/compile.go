@@ -5,8 +5,11 @@
 package ssa
 
 import (
+	"cmd/internal/objabi"
+	"cmd/internal/src"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"runtime"
 	"strings"
@@ -40,7 +43,10 @@ func Compile(f *Func) {
 
 	// Run all the passes
 	printFunc(f)
-	f.Config.HTML.WriteFunc("start", f)
+	f.HTMLWriter.WriteFunc("start", f)
+	if BuildDump != "" && BuildDump == f.Name {
+		f.dumpFile("build")
+	}
 	if checkEnabled {
 		checkFunc(f)
 	}
@@ -65,7 +71,7 @@ func Compile(f *Func) {
 		tEnd := time.Now()
 
 		// Need something less crude than "Log the whole intermediate result".
-		if f.Log() || f.Config.HTML != nil {
+		if f.Log() || f.HTMLWriter != nil {
 			time := tEnd.Sub(tStart).Nanoseconds()
 			var stats string
 			if logMemStats {
@@ -80,7 +86,7 @@ func Compile(f *Func) {
 
 			f.Logf("  pass %s end %s\n", p.name, stats)
 			printFunc(f)
-			f.Config.HTML.WriteFunc(fmt.Sprintf("after %s <span class=\"stats\">%s</span>", phaseName, stats), f)
+			f.HTMLWriter.WriteFunc(fmt.Sprintf("after %s <span class=\"stats\">%s</span>", phaseName, stats), f)
 		}
 		if p.time || p.mem {
 			// Surround timing information w/ enough context to allow comparisons.
@@ -96,6 +102,10 @@ func Compile(f *Func) {
 				f.LogStat("TIME(ns):BYTES:ALLOCS", time, nBytes, nAllocs)
 			}
 		}
+		if p.dump != nil && p.dump[f.Name] {
+			// Dump function to appropriately named file
+			f.dumpFile(phaseName)
+		}
 		if checkEnabled {
 			checkFunc(f)
 		}
@@ -105,16 +115,48 @@ func Compile(f *Func) {
 	phaseName = ""
 }
 
+// TODO: should be a config field
+var dumpFileSeq int
+
+// dumpFile creates a file from the phase name and function name
+// Dumping is done to files to avoid buffering huge strings before
+// output.
+func (f *Func) dumpFile(phaseName string) {
+	dumpFileSeq++
+	fname := fmt.Sprintf("%s_%02d__%s.dump", f.Name, dumpFileSeq, phaseName)
+	fname = strings.Replace(fname, " ", "_", -1)
+	fname = strings.Replace(fname, "/", "_", -1)
+	fname = strings.Replace(fname, ":", "_", -1)
+
+	fi, err := os.Create(fname)
+	if err != nil {
+		f.Warnl(src.NoXPos, "Unable to create after-phase dump file %s", fname)
+		return
+	}
+
+	p := stringFuncPrinter{w: fi}
+	fprintFunc(p, f)
+	fi.Close()
+}
+
 type pass struct {
 	name     string
 	fn       func(*Func)
 	required bool
 	disabled bool
-	time     bool // report time to run pass
-	mem      bool // report mem stats to run pass
-	stats    int  // pass reports own "stats" (e.g., branches removed)
-	debug    int  // pass performs some debugging. =1 should be in error-testing-friendly Warnl format.
-	test     int  // pass-specific ad-hoc option, perhaps useful in development
+	time     bool            // report time to run pass
+	mem      bool            // report mem stats to run pass
+	stats    int             // pass reports own "stats" (e.g., branches removed)
+	debug    int             // pass performs some debugging. =1 should be in error-testing-friendly Warnl format.
+	test     int             // pass-specific ad-hoc option, perhaps useful in development
+	dump     map[string]bool // dump if function name matches
+}
+
+func (p *pass) addDump(s string) {
+	if p.dump == nil {
+		p.dump = make(map[string]bool)
+	}
+	p.dump[s] = true
 }
 
 // Run consistency checker between each phase
@@ -127,6 +169,7 @@ var IntrinsicsDisable bool
 var BuildDebug int
 var BuildTest int
 var BuildStats int
+var BuildDump string // name of function to dump after initial build of ssa
 
 // PhaseOption sets the specified flag in the specified ssa phase,
 // returning empty string if this was successful or a string explaining
@@ -146,7 +189,35 @@ var BuildStats int
 //
 // BOOT_GO_GCFLAGS=-d='ssa/~^.*scc$/off' GO_GCFLAGS='-d=ssa/~^.*scc$/off' ./make.bash
 //
-func PhaseOption(phase, flag string, val int) string {
+func PhaseOption(phase, flag string, val int, valString string) string {
+	if phase == "help" {
+		lastcr := 0
+		phasenames := "check, all, build, intrinsics"
+		for _, p := range passes {
+			pn := strings.Replace(p.name, " ", "_", -1)
+			if len(pn)+len(phasenames)-lastcr > 70 {
+				phasenames += "\n"
+				lastcr = len(phasenames)
+				phasenames += pn
+			} else {
+				phasenames += ", " + pn
+			}
+		}
+		return "" +
+			`GcFlag -d=ssa/<phase>/<flag>[=<value>|<function_name>]
+<phase> is one of:
+` + phasenames + `
+<flag> is one of on, off, debug, mem, time, test, stats, dump
+<value> defaults to 1
+<function_name> is required for "dump", specifies name of function to dump after <phase>
+Except for dump, output is directed to standard out; dump appears in a file.
+Phase "all" supports flags "time", "mem", and "dump".
+Phases "intrinsics" supports flags "on", "off", and "debug".
+Interpretation of the "debug" value depends on the phase.
+Dump files are named <phase>__<function_name>_<seq>.dump.
+`
+	}
+
 	if phase == "check" && flag == "on" {
 		checkEnabled = val != 0
 		return ""
@@ -157,9 +228,18 @@ func PhaseOption(phase, flag string, val int) string {
 	}
 
 	alltime := false
+	allmem := false
+	alldump := false
 	if phase == "all" {
 		if flag == "time" {
 			alltime = val != 0
+		} else if flag == "mem" {
+			allmem = val != 0
+		} else if flag == "dump" {
+			alldump = val != 0
+			if alldump {
+				BuildDump = valString
+			}
 		} else {
 			return fmt.Sprintf("Did not find a flag matching %s in -d=ssa/%s debug option", flag, phase)
 		}
@@ -186,6 +266,8 @@ func PhaseOption(phase, flag string, val int) string {
 			BuildTest = val
 		case "stats":
 			BuildStats = val
+		case "dump":
+			BuildDump = valString
 		default:
 			return fmt.Sprintf("Did not find a flag matching %s in -d=ssa/%s debug option", flag, phase)
 		}
@@ -205,6 +287,10 @@ func PhaseOption(phase, flag string, val int) string {
 	for i, p := range passes {
 		if phase == "all" {
 			p.time = alltime
+			p.mem = allmem
+			if alldump {
+				p.addDump(valString)
+			}
 			passes[i] = p
 			matchedOne = true
 		} else if p.name == phase || p.name == underphase || re != nil && re.MatchString(p.name) {
@@ -223,6 +309,8 @@ func PhaseOption(phase, flag string, val int) string {
 				p.stats = val
 			case "test":
 				p.test = val
+			case "dump":
+				p.addDump(valString)
 			default:
 				return fmt.Sprintf("Did not find a flag matching %s in -d=ssa/%s debug option", flag, phase)
 			}
@@ -256,15 +344,19 @@ var passes = [...]pass{
 	{name: "prove", fn: prove},
 	{name: "loopbce", fn: loopbce},
 	{name: "decompose builtin", fn: decomposeBuiltIn, required: true},
-	{name: "dec", fn: dec, required: true},
+	{name: "softfloat", fn: softfloat, required: true},
 	{name: "late opt", fn: opt, required: true}, // TODO: split required rules and optimizing rules
 	{name: "generic deadcode", fn: deadcode},
 	{name: "check bce", fn: checkbce},
 	{name: "fuse", fn: fuse},
 	{name: "dse", fn: dse},
+	{name: "writebarrier", fn: writebarrier, required: true}, // expand write barrier ops
+	{name: "insert resched checks", fn: insertLoopReschedChecks,
+		disabled: objabi.Preemptibleloops_enabled == 0}, // insert resched checks in loops.
 	{name: "tighten", fn: tighten}, // move values closer to their uses
 	{name: "lower", fn: lower, required: true},
 	{name: "lowered cse", fn: cse},
+	{name: "elim unread autos", fn: elimUnreadAutos},
 	{name: "lowered deadcode", fn: deadcode, required: true},
 	{name: "checkLower", fn: checkLower, required: true},
 	{name: "late phielim", fn: phielim},
@@ -278,6 +370,7 @@ var passes = [...]pass{
 	{name: "late nilcheck", fn: nilcheckelim2},
 	{name: "flagalloc", fn: flagalloc, required: true}, // allocate flags register
 	{name: "regalloc", fn: regalloc, required: true},   // allocate int & float registers + stack slots
+	{name: "loop rotate", fn: loopRotate},
 	{name: "stackframe", fn: stackframe, required: true},
 	{name: "trim", fn: trim}, // remove empty blocks
 }
@@ -291,7 +384,13 @@ type constraint struct {
 }
 
 var passOrder = [...]constraint{
-	// prove reliese on common-subexpression elimination for maximum benefits.
+	// "insert resched checks" uses mem, better to clean out stores first.
+	{"dse", "insert resched checks"},
+	// insert resched checks adds new blocks containing generic instructions
+	{"insert resched checks", "lower"},
+	{"insert resched checks", "tighten"},
+
+	// prove relies on common-subexpression elimination for maximum benefits.
 	{"generic cse", "prove"},
 	// deadcode after prove to eliminate all new dead blocks.
 	{"prove", "generic deadcode"},
@@ -315,6 +414,8 @@ var passOrder = [...]constraint{
 	{"generic deadcode", "check bce"},
 	// don't run optimization pass until we've decomposed builtin objects
 	{"decompose builtin", "late opt"},
+	// decompose builtin is the last pass that may introduce new float ops, so run softfloat after it
+	{"decompose builtin", "softfloat"},
 	// don't layout blocks until critical edges have been removed
 	{"critical", "layout"},
 	// regalloc requires the removal of all critical edges
@@ -330,6 +431,8 @@ var passOrder = [...]constraint{
 	{"schedule", "flagalloc"},
 	// regalloc needs flags to be allocated first.
 	{"flagalloc", "regalloc"},
+	// loopRotate will confuse regalloc.
+	{"regalloc", "loop rotate"},
 	// stackframe needs to know about spilled registers.
 	{"regalloc", "stackframe"},
 	// trim needs regalloc to be done first.

@@ -8,8 +8,8 @@
 
 // NOTE: Windows externalthreadhandler expects memclr to preserve DX.
 
-// void runtime·memclr(void*, uintptr)
-TEXT runtime·memclr(SB), NOSPLIT, $0-8
+// void runtime·memclrNoHeapPointers(void*, uintptr)
+TEXT runtime·memclrNoHeapPointers(SB), NOSPLIT, $0-8
 	MOVL	ptr+0(FP), DI
 	MOVL	n+4(FP), BX
 	XORL	AX, AX
@@ -27,8 +27,8 @@ tail:
 	JBE	_5through8
 	CMPL	BX, $16
 	JBE	_9through16
-	TESTL	$0x4000000, runtime·cpuid_edx(SB) // check for sse2
-	JEQ	nosse2
+	CMPB	runtime·support_sse2(SB), $1
+	JNE	nosse2
 	PXOR	X0, X0
 	CMPL	BX, $32
 	JBE	_17through32
